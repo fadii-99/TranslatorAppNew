@@ -1,0 +1,13 @@
+streamlit
+langchain
+openai
+pandas
+python-dotenv
+openpyxl
+langchain-openai
+langchain-community
+PyMuPDF
+python-docx
+lxml
+langchain-core
+modernmt
