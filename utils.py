@@ -28,6 +28,8 @@ class DocxTranslator:
         self.extract_folder = tempfile.mkdtemp(prefix="docx_extract_")
         self.word_ns = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
         self.translations_cache = {}  # Cache to store translations
+        self.used_glossary_words = set()  # NEW: Track which glossary words were used
+        self.used_glossary_pairs = set() 
         # Set glossary file based on target language
         if target_language.lower() == 'ar':
             self.glossary_file = "glossary_ar.xlsx"
@@ -67,6 +69,14 @@ class DocxTranslator:
                 print(f"Error loading glossary {self.glossary_file}: {e}")
                 return {}
         return {}
+    def get_used_glossary_words(self):
+        """Return just the list of English glossary words that were used."""
+        return list(self.used_glossary_words)
+
+    def get_used_glossary_pairs(self):
+        """Return (word, translation) tuples that were used in the translation."""
+        return list(self.used_glossary_pairs)
+
 
     def generate_glossary(self):
         """Generate or update the language-specific glossary from the document"""
@@ -175,10 +185,10 @@ class DocxTranslator:
                 You are a professional translator. Translate the given text from {source_language} to {output_language}.
                 Your translation must be precise, accurate, fluent, and natural-sounding in the target language, preserving the original meaning.
 
-                When translating, use the glossary as a reference guide for key terms, but ensure you:
+                When translating, use the glossary as a reference for key terms, but ensure you:
                 1. Maintain proper grammatical structure in the target language
-                2. Adapt the sentence flow naturally without word-for-word translation
-                3. Keep the context and meaning of the complete sentence intact
+                2. Adapt the sentence flow naturally, not word-for-word
+                3. Keep the context and meaning of the sentence intact
 
                 Reference Glossary:
                 {glossary_context}
@@ -186,7 +196,11 @@ class DocxTranslator:
                 Original text ({source_language}):
                 {input}
 
-                Translated text ({output_language}):
+                Your response **must** follow this exact format:
+
+                Translated text ({output_language}): <translation_here>
+
+                Glossary words used (English, comma-separated): <word1, word2, ...>
                 """
             )
             llm = ChatOpenAI(model_name="gpt-4o", api_key=self.OPENAI_API_KEY, temperature=0.3)
@@ -204,22 +218,36 @@ class DocxTranslator:
                     "input": text,
                     "glossary_context": glossary_context
                 })
-                translated_text = response.content.strip()
-                # Post-process to remove any unwanted quotation marks
-                translated_text = re.sub(r'^"(.*)"$', r'\1', translated_text)
-                return translated_text
+                resp = response.content.strip()
+
+                # PARSE THE RESPONSE
+                m1 = re.search(r"Translated text.*?:\s*(.*?)\n+Glossary words used.*?:\s*(.*)", resp, re.DOTALL)
+                if m1:
+                    translated_text = m1.group(1).strip()
+                    glossary_used = m1.group(2).strip()
+                    glossary_used_list = [w.strip() for w in glossary_used.split(",") if w.strip()]
+                    for word in glossary_used_list:
+                        self.used_glossary_words.add(word)
+                        if word in glossary:
+                            self.used_glossary_pairs.add((word, glossary[word]))
+                else:
+                    # fallback: return everything, don't break
+                    translated_text = resp
             except Exception as e:
                 print(f"Translation error: {e}")
                 return text
 
         elif self.mmt:
+            # ... (ModernMT logic stays as is)
             try:
                 translation = self.mmt.translate("en", self.target_language, text)
                 translated_text = translation.translation
-                return translated_text
             except Exception as e:
                 print(f"Error translating text with ModernMT: {e}")
                 return text
+
+        return translated_text
+
 
     def translate_xml_to_language(self, xml_path, source_lang="en", target_lang="ur", output_path=None):
         parser = etree.XMLParser(remove_blank_text=False)
@@ -347,3 +375,10 @@ def translate_file(input_file, output_file, target_language, ModernMT_key, OPENA
     else:
         raise ValueError(f"Unsupported file type: {file_extension}. Please use .docx")
     translator.run()
+    # NEW: Get the used glossary list
+    used_glossary = translator.get_used_glossary_words()
+    used_glossary_pairs = translator.get_used_glossary_pairs()
+    # You can log it, return it, or save it as needed:
+    print("Glossary words used in translation:", used_glossary)
+    print("Word/Translation pairs used:", used_glossary_pairs)
+    return used_glossary, used_glossary_pairs

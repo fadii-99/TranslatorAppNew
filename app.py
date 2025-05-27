@@ -67,29 +67,71 @@ if uploaded_file and target_langs:
         # Start translation process with loading spinner
         with st.spinner(f"Translating {file_format} to {', '.join(target_langs)} using {selected_model}..."):
 
-            if file_extension == "docx":
-                output_file_path = f"translated_document_{target_langs[0].lower()}_{selected_model}_{str(uuid.uuid4())}.{file_extension}"
+            output_file_path = f"translated_document_{target_langs[0].lower()}_{selected_model}_{str(uuid.uuid4())}.{file_extension}"
+            
+            # Translate the file and get the glossary usage info
+            if selected_model == 'OpenAI':
+                used_glossary, used_glossary_pairs = translate_file(
+                    input_file_path, output_file_path, target_langs[0], None, OPENAI_API_KEY
+                )
+            else:
+                used_glossary, used_glossary_pairs = translate_file(
+                    input_file_path, output_file_path, target_langs[0], ModernMT_key, None
+                )
+
+            # Define appropriate MIME types for DOCX files
+            mime_types = {
+                "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "odt": "application/vnd.oasis.opendocument.text",
+                "doc": "application/doc"
+            }
+
+            with open(output_file_path, "rb") as f:
+                st.download_button(
+                    label=f"Download Translated Document ({target_langs[0]})",
+                    data=f,
+                    file_name=f"{output_file_path}",
+                    mime=mime_types[file_extension],
+                )
+            
+            # Show used glossary words in the Streamlit app
+            st.write("### Glossary Words Used in Translation:")
+            if used_glossary:
+                st.markdown("---")
+                st.write("📚 **Matched Glossary Terms:**")
                 
-                # Translate the file using your custom translator
-                if selected_model == 'OpenAI':
-                    translate_file(input_file_path, output_file_path, target_langs[0], None, OPENAI_API_KEY )
-                else:
-                    translate_file(input_file_path, output_file_path, target_langs[0], ModernMT_key, None )
+                # Create columns for better space utilization
+                TERMS_PER_COLUMN = 10
+                terms = sorted(used_glossary)
                 
-                # Define appropriate MIME types for DOCX files
-                mime_types = {
-                    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    "odt": "application/vnd.oasis.opendocument.text",
-                    "doc": "application/doc"
-                }
-    
-                with open(output_file_path, "rb") as f:
-                    st.download_button(
-                        label=f"Download Translated Document ({target_langs[0]})",
-                        data=f,
-                        file_name=f"{output_file_path}",
-                        mime=mime_types[file_extension],
-                    )
+                # Display terms in a grid layout
+                cols = st.columns(3)  # Create 3 columns
+                for i, term in enumerate(terms):
+                    col_index = i % 3
+                    cols[col_index].write(f"• {term}")
+                
+                # Add pagination if there are many terms
+                # if len(terms) > 30:  # Show pagination for large lists
+                #     items_per_page = 30
+                #     pages = len(terms) // items_per_page + (1 if len(terms) % items_per_page > 0 else 0)
+                #     current_page = st.selectbox("Page", range(1, pages + 1), label_visibility="collapsed")
+                #     start_idx = (current_page - 1) * items_per_page
+                #     end_idx = min(start_idx + items_per_page, len(terms))
+                    
+                st.markdown("---")
+                import pandas as pd
+                df = pd.DataFrame(used_glossary_pairs, columns=['English', f'{target_lang.upper()} Translation'])
+                csv = df.to_csv(index=False)
+                st.download_button(
+                    "Download Used Glossary List (CSV)",
+                    csv,
+                    f"used_glossary_{target_langs[0]}.csv",
+                    "text/csv"
+                )
+            else:
+                st.write("No glossary words were matched in this translation.")
+
+
 
 else:
     if uploaded_file and not target_langs:
