@@ -91,15 +91,9 @@ class DocxTranslator:
             prompt = PromptTemplate.from_template(
                 """
                 You are a professional translator. Translate the given text from {source_language} to {output_language}.
-                Your translation must be precise, accurate, fluent, and natural-sounding in the target language, preserving the original meaning. Additionally, you must track and categorize all translated words based on whether they were found in the provided glossary or translated independently.
+                Your translation must be precise, accurate, fluent, and natural-sounding in the target language, preserving the original meaning.
 
-                When translating, use the glossary as a reference for key terms, but ensure you:
-                1. Maintain proper grammatical structure in the target language
-                2. Adapt the sentence flow naturally, not word-for-word
-                3. Keep the context and meaning of the sentence intact
-                4. Carefully track which words you translate using the glossary versus your own knowledge
-                5. Include all meaningful words (nouns, verbs, adjectives, adverbs) in your tracking, not just technical terms
-                6. For compound words or phrases, break them down appropriately when listing translations
+                Use the glossary for any word if present. If not, always translate yourself. **Never reply in English, never ask for original text, and never apologize.** Every input must be translated. Do not skip or refuse.
 
                 Reference Glossary:
                 {glossary_context}
@@ -137,6 +131,7 @@ class DocxTranslator:
                 })
                 resp = response.content.strip()
 
+                # Robust parsing of the output format
                 m = re.search(
                     r"Translated text.*?:\s*(.*?)\n+List 1.*?:\s*(.*?)(?:\n+List 2.*?:\s*(.*))?$",
                     resp, re.DOTALL
@@ -164,7 +159,32 @@ class DocxTranslator:
                     for pair in nonglossary_pairs:
                         self.nonglossary_pairs.add(pair)
                 else:
+                    # If parsing fails, try to extract Urdu/Arabic text chunks
                     translated_text = resp
+                    if self.target_language.lower() == 'ur':
+                        urdu_text_match = re.findall(r'[\u0600-\u06FF\s,.\-؛؟]+', resp)
+                        if urdu_text_match:
+                            translated_text = ' '.join(urdu_text_match)
+                    # Add Arabic support if needed
+                    if self.target_language.lower() == 'ar':
+                        arabic_text_match = re.findall(r'[\u0600-\u06FF\s,.\-؛؟]+', resp)
+                        if arabic_text_match:
+                            translated_text = ' '.join(arabic_text_match)
+
+                # If translation is an unwanted English prompt, fallback
+                unwanted_phrases = [
+                    "Certainly! Please provide the original text",
+                    "please provide the original text",
+                    "I'm sorry",
+                    "cannot translate",
+                    "unable to translate",
+                    "provide more information",
+                    "not enough information",
+                    "please provide"
+                ]
+                if any(phrase.lower() in translated_text.lower() for phrase in unwanted_phrases):
+                    translated_text = text  # Fallback: just use the original text (or try translating with a different engine, if you want)
+
             except Exception as e:
                 print(f"Translation error: {e}")
                 return text
@@ -174,6 +194,7 @@ class DocxTranslator:
             return text
 
         return translated_text
+
 
     def translate_xml_to_language(self, xml_path, source_lang="en", target_lang="ur", output_path=None):
         parser = etree.XMLParser(remove_blank_text=False)
