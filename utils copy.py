@@ -3,11 +3,13 @@ import zipfile
 import shutil
 import tempfile
 import re
+from collections import Counter
 import pandas as pd
 from docx import Document
 from langchain_openai import ChatOpenAI
 from lxml import etree
 from dotenv import load_dotenv
+from modernmt import ModernMT
 from langchain_core.prompts import PromptTemplate
 
 load_dotenv()
@@ -18,19 +20,35 @@ RTL_LANGUAGES = {
 }
 
 class DocxTranslator:
-    def __init__(self, input_file, output_file, target_language, glossary_file_path, OPENAI_API_KEY):
+    def __init__(self, input_file, output_file, target_language, ModernMT_key, OPENAI_API_KEY):
         self.input_file = input_file
         self.output_file = output_file
         self.target_language = target_language
         self.source_lang = 'English'
         self.extract_folder = tempfile.mkdtemp(prefix="docx_extract_")
         self.word_ns = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-        self.translations_cache = {}
-        self.used_glossary_words = set()
+        self.translations_cache = {}  # Cache to store translations
+
+        # For tracking used glossary words/pairs and non-glossary pairs
+        self.used_glossary_words = set() 
         self.used_glossary_pairs = set()
-        self.nonglossary_pairs = set()
-        self.glossary_file_path = glossary_file_path
-        self.OPENAI_API_KEY = OPENAI_API_KEY
+        self.nonglossary_pairs = set()   # NEW
+
+        # Set glossary file based on target language
+        if target_language.lower() == 'ar':
+            self.glossary_file = "glossary_ar.xlsx"
+        elif target_language.lower() == 'ur':
+            self.glossary_file = "glossary_ur.xlsx"
+        else:
+            raise ValueError(f"Unsupported target language: {target_language}. Only 'ar' and 'ur' are supported.")
+        if ModernMT_key:
+            self.mmt = ModernMT(ModernMT_key)
+            self.OPENAI_API_KEY = None
+        elif OPENAI_API_KEY:
+            self.mmt = None
+            self.OPENAI_API_KEY = OPENAI_API_KEY
+        else:
+            raise ValueError("Either ModernMT_key or OPENAI_API_KEY must be provided")
 
     def read_document(self, file_path):
         if file_path.endswith('.docx'):
@@ -39,28 +57,19 @@ class DocxTranslator:
         else:
             raise ValueError("Only .docx supported.")
 
+    def process_text(self, text):
+        words = re.findall(r'\b\w+\b', text.lower())
+        return Counter(words)
+
     def load_glossary(self):
-        if not self.glossary_file_path or not os.path.exists(self.glossary_file_path):
-            return {}
-        ext = os.path.splitext(self.glossary_file_path)[1].lower()
-        try:
-            if ext == ".csv":
-                df = pd.read_csv(self.glossary_file_path)
-            elif ext in [".xlsx", ".xls"]:
-                df = pd.read_excel(self.glossary_file_path)
-            else:
+        if os.path.exists(self.glossary_file):
+            try:
+                df = pd.read_excel(self.glossary_file)
+                return dict(zip(df['Word'], df[f'{self.target_language.upper()} Translation']))
+            except Exception as e:
+                print(f"Error loading glossary {self.glossary_file}: {e}")
                 return {}
-            # Must have columns: "Word" and "[LANG Translation]" (like "ARABIC Translation")
-            # Try to detect the translation column
-            word_col = [col for col in df.columns if col.strip().lower() == "word"]
-            trans_col = [col for col in df.columns if self.target_language.upper() in col.upper()]
-            if not word_col or not trans_col:
-                return {}
-            # Ensure strings for matching
-            return dict(zip(df[word_col[0]].astype(str).str.strip(), df[trans_col[0]].astype(str).str.strip()))
-        except Exception as e:
-            print(f"Error loading uploaded glossary: {e}")
-            return {}
+        return {}
 
     def get_used_glossary_words(self):
         return list(self.used_glossary_words)
@@ -68,8 +77,82 @@ class DocxTranslator:
     def get_used_glossary_pairs(self):
         return list(self.used_glossary_pairs)
 
-    def get_nonglossary_pairs(self):
+    def get_nonglossary_pairs(self):  # NEW
         return list(self.nonglossary_pairs)
+
+    def generate_glossary(self):
+        existing_glossary = {}
+        existing_df = None
+        if os.path.exists(self.glossary_file):
+            try:
+                existing_df = pd.read_excel(self.glossary_file)
+                existing_glossary = dict(zip(existing_df['Word'], existing_df[f'{self.target_language.upper()} Translation']))
+                print(f"Loaded existing glossary with {len(existing_glossary)} entries: {self.glossary_file}")
+            except Exception as e:
+                print(f"Error loading glossary {self.glossary_file}: {e}")
+
+        text = self.read_document(self.input_file)
+        word_counts = self.process_text(text)
+
+        new_data = []
+        for word, count in word_counts.items():
+            if word in existing_glossary:
+                continue
+
+            translated = self.translate_word(word)
+            new_data.append({
+                'Word': word,
+                'Frequency': count,
+                f'{self.target_language.upper()} Translation': translated
+            })
+
+        if new_data:
+            new_df = pd.DataFrame(new_data)
+            if existing_df is not None:
+                updated_df = pd.concat([existing_df, new_df], ignore_index=True)
+                updated_df = updated_df.drop_duplicates(subset=['Word'], keep='last')
+                updated_df.sort_values(by='Frequency', ascending=False, inplace=True)
+                updated_df.to_excel(self.glossary_file, index=False)
+                print(f"Appended {len(new_data)} new words to glossary: {self.glossary_file}")
+            else:
+                new_df.sort_values(by='Frequency', ascending=False, inplace=True)
+                new_df.to_excel(self.glossary_file, index=False)
+                print(f"Created new glossary with {len(new_data)} words: {self.glossary_file}")
+        else:
+            print(f"No new words to add to glossary: {self.glossary_file}")
+
+    def translate_word(self, word):
+        if word in self.translations_cache:
+            return self.translations_cache[word]
+        
+        try:
+            if self.OPENAI_API_KEY:
+                prompt = PromptTemplate.from_template(
+                    """
+                    You are a professional translator. Translate the given word from English to {target_language}.
+                    Provide only the translation without any explanations or quotation marks.
+
+                    English word: {input}
+                    {target_language} translation:
+                    """
+                )
+                llm = ChatOpenAI(
+                    model_name="gpt-4o",
+                    api_key=self.OPENAI_API_KEY,
+                    temperature=0.1
+                )
+                chain = prompt | llm
+                response = chain.invoke({"input": word, "target_language": self.target_language})
+                translated = response.content.strip()
+            elif self.mmt:
+                translation = self.mmt.translate("en", self.target_language, word)
+                translated = translation.translation
+
+            self.translations_cache[word] = translated
+            return translated
+        except Exception as e:
+            print(f"Error translating {word}: {str(e)}")
+            return "Translation Error"
 
     def extract_docx(self):
         with zipfile.ZipFile(self.input_file, 'r') as zip_ref:
@@ -137,6 +220,7 @@ class DocxTranslator:
                 })
                 resp = response.content.strip()
 
+                # Parse both lists using regex
                 m = re.search(
                     r"Translated text.*?:\s*(.*?)\n+List 1.*?:\s*(.*?)(?:\n+List 2.*?:\s*(.*))?$",
                     resp, re.DOTALL
@@ -158,6 +242,7 @@ class DocxTranslator:
                             eng, trans = [x.strip() for x in line.split(',', 1)]
                             if eng and trans:
                                 nonglossary_pairs.append((eng, trans))
+                    # Store for later reporting
                     for pair in glossary_pairs:
                         self.used_glossary_words.add(pair[0])
                         self.used_glossary_pairs.add(pair)
@@ -169,9 +254,13 @@ class DocxTranslator:
                 print(f"Translation error: {e}")
                 return text
 
-        else:
-            print("No OpenAI API key provided.")
-            return text
+        elif self.mmt:
+            try:
+                translation = self.mmt.translate("en", self.target_language, text)
+                translated_text = translation.translation
+            except Exception as e:
+                print(f"Error translating text with ModernMT: {e}")
+                return text
 
         return translated_text
 
@@ -197,18 +286,21 @@ class DocxTranslator:
                 except Exception as e:
                     print(f"Error translating tail text: {e}")
 
-        # RTL formatting
+        # Apply RTL formatting for RTL languages
         if target_lang.lower() in [lang.lower() for lang in RTL_LANGUAGES]:
             for p in root.findall('.//{%s}p' % self.word_ns):
                 pPr = p.find('{%s}pPr' % self.word_ns)
                 if pPr is None:
                     pPr = etree.SubElement(p, '{%s}pPr' % self.word_ns)
+
                 if pPr.find('{%s}bidi' % self.word_ns) is None:
                     bidi = etree.SubElement(pPr, '{%s}bidi' % self.word_ns)
+
                 jc = pPr.find('{%s}jc' % self.word_ns)
                 if jc is None:
                     jc = etree.SubElement(pPr, '{%s}jc' % self.word_ns)
                 jc.set('{%s}val' % self.word_ns, 'right')
+
                 for r in p.findall('.//{%s}r' % self.word_ns):
                     rPr = r.find('{%s}rPr' % self.word_ns)
                     if rPr is None:
@@ -234,6 +326,7 @@ class DocxTranslator:
             if os.path.exists(settings_path):
                 settings_tree = etree.parse(settings_path, parser)
                 settings_root = settings_tree.getroot()
+
                 lang = settings_root.find('.//{%s}lang' % self.word_ns)
                 if lang is None:
                     lang = etree.SubElement(settings_root, '{%s}lang' % self.word_ns)
@@ -247,6 +340,7 @@ class DocxTranslator:
                     cs.set('{%s}name' % self.word_ns, 'useFELayout')
                     cs.set('{%s}uri' % self.word_ns, 'http://schemas.microsoft.com/office/word')
                     cs.set('{%s}val' % self.word_ns, '1')
+
                 settings_tree.write(settings_path, encoding='utf-8', xml_declaration=True, pretty_print=True)
 
         if output_path:
@@ -261,6 +355,7 @@ class DocxTranslator:
         os.makedirs(self.extract_folder, exist_ok=True)
 
         try:
+            self.generate_glossary()
             xml_path = self.extract_docx()
             self.translate_xml_to_language(xml_path, source_lang="en", target_lang=self.target_language, output_path=xml_path)
             self.create_translated_docx()
@@ -274,14 +369,17 @@ class DocxTranslator:
                 except Exception as e:
                     print(f"Warning: Could not clean up temporary folder: {e}")
 
-def translate_file(input_file, output_file, target_language, glossary_file_path, OPENAI_API_KEY):
+def translate_file(input_file, output_file, target_language, ModernMT_key, OPENAI_API_KEY):
     file_extension = os.path.splitext(input_file)[1].lower()
     if file_extension == '.docx':
-        translator = DocxTranslator(input_file, output_file, target_language, glossary_file_path, OPENAI_API_KEY)
+        translator = DocxTranslator(input_file, output_file, target_language, ModernMT_key, OPENAI_API_KEY)
     else:
         raise ValueError(f"Unsupported file type: {file_extension}. Please use .docx")
     translator.run()
     used_glossary = translator.get_used_glossary_words()
     used_glossary_pairs = translator.get_used_glossary_pairs()
-    nonglossary_pairs = translator.get_nonglossary_pairs()
+    nonglossary_pairs = translator.get_nonglossary_pairs()  # NEW
+    print("Glossary words used in translation:", used_glossary)
+    print("Word/Translation pairs used (from glossary):", used_glossary_pairs)
+    print("Word/Translation pairs NOT in glossary:", nonglossary_pairs)
     return used_glossary, used_glossary_pairs, nonglossary_pairs

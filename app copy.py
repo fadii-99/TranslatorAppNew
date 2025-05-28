@@ -13,13 +13,9 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or st.secrets.get('OPENAI_API_
 st.set_page_config(page_title="Document Translator", layout="centered")
 st.title("Document Translator")
 
-# Upload DOCX file
-docx_file = st.file_uploader("Upload your Word document to translate", type=["docx"])
-
-# Upload glossary file
-glossary_file = st.file_uploader("Upload your Glossary (CSV or Excel)", type=["csv", "xlsx"])
-
-file_extension = os.path.splitext(docx_file.name)[1].lower()[1:] if docx_file else None
+file_format = st.selectbox("Choose File Format to Upload:", ["DOCX"])
+uploaded_file = st.file_uploader("Upload your Word document", type=["docx"])
+file_extension = os.path.splitext(uploaded_file.name)[1].lower()[1:] if uploaded_file else None
 
 selected_model = st.selectbox("Select Translation Model:", ["OpenAI"])
 st.info("Source language: English (Fixed)")
@@ -27,46 +23,52 @@ st.info("Source language: English (Fixed)")
 language_map = {"Arabic": "ar", "Urdu": "ur"}
 languages = list(language_map.keys())
 target_langs = []
-if docx_file and file_extension == "docx":
-    target_lang = st.selectbox("Select Target Language (for Word Documents):", languages, index=0)
-    target_langs = [language_map.get(target_lang)] if target_lang else []
+if uploaded_file:
+    if file_extension in "docx":
+        target_lang = st.selectbox("Select Target Language (for Word Documents):", languages, index=0)
+        target_langs = [language_map.get(target_lang)] if target_lang else []
 else:
-    st.write(f"Please upload a DOCX file to select target languages.")
+    st.write(f"Please upload a {file_format} file to select target languages.")
 
-if docx_file and glossary_file and target_langs:
+# Translation process
+if uploaded_file and target_langs:
     if st.button("Translate"):
-        st.success(f"Files uploaded successfully! Processing DOCX file...")
-        # Save uploaded files temporarily
-        input_file_path = f"uploaded_file_{str(uuid.uuid4())}.docx"
+        st.success(f"File uploaded successfully! Processing {file_format} file...")
+        input_file_path = f"uploaded_file_{str(uuid.uuid4())}.{file_extension}"
         with open(input_file_path, "wb") as f:
-            f.write(docx_file.read())
+            f.write(uploaded_file.read())
 
-        # Save glossary file
-        glossary_ext = os.path.splitext(glossary_file.name)[1].lower()
-        glossary_temp_path = f"uploaded_glossary_{str(uuid.uuid4())}{glossary_ext}"
-        with open(glossary_temp_path, "wb") as f:
-            f.write(glossary_file.read())
+        with st.spinner(f"Translating {file_format} to {', '.join(target_langs)} using {selected_model}..."):
+            output_file_path = f"translated_document_{target_langs[0].lower()}_{selected_model}_{str(uuid.uuid4())}.{file_extension}"
 
-        with st.spinner(f"Translating DOCX to {', '.join(target_langs)} using {selected_model}..."):
-            output_file_path = f"translated_document_{target_langs[0].lower()}_{selected_model}_{str(uuid.uuid4())}.docx"
+            # Translate the file
+            if selected_model == 'OpenAI':
+                used_glossary, used_glossary_pairs, used_non_glossary_pairs =  translate_file(
+                    input_file_path, output_file_path, target_langs[0], None, OPENAI_API_KEY
+                )
+            else:
+                used_glossary, used_glossary_pairs, used_non_glossary_pairs = translate_file(
+                    input_file_path, output_file_path, target_langs[0], ModernMT_key, None
+                )
 
-            # Translate the file (pass glossary path!)
-            used_glossary, used_glossary_pairs, used_non_glossary_pairs =  translate_file(
-                input_file_path, output_file_path, target_langs[0], glossary_temp_path, OPENAI_API_KEY
-            )
-
+            # Read output docx as bytes
             with open(output_file_path, "rb") as f:
                 st.session_state["translated_docx_bytes"] = f.read()
+            # Prepare CSVs and store in session state
             df_glossary = pd.DataFrame(used_glossary_pairs, columns=['English', f'{target_lang.upper()} Translation'])
             st.session_state["glossary_csv_bytes"] = df_glossary.to_csv(index=False).encode('utf-8')
+
             df_non_glossary = pd.DataFrame(used_non_glossary_pairs, columns=['English', f'{target_lang.upper()} Translation'])
             st.session_state["non_glossary_csv_bytes"] = df_non_glossary.to_csv(index=False).encode('utf-8')
 
+            # Save the language and extension for download filename
             st.session_state["target_lang"] = target_lang
             st.session_state["target_lang_code"] = target_langs[0]
             st.session_state["file_extension"] = file_extension
+
             st.success("Translation complete! You can now download your files below.")
 
+# Download section: Always show if session state is populated
 if "translated_docx_bytes" in st.session_state:
     target_lang = st.session_state.get("target_lang", "Arabic")
     target_lang_code = st.session_state.get("target_lang_code", "ar")
@@ -80,6 +82,7 @@ if "translated_docx_bytes" in st.session_state:
     st.markdown("---")
     st.subheader("Download your translated files:")
 
+    # DOCX download
     st.download_button(
         label=f"Download Translated Document ({target_lang})",
         data=st.session_state["translated_docx_bytes"],
@@ -88,6 +91,7 @@ if "translated_docx_bytes" in st.session_state:
         use_container_width=True
     )
 
+    # Glossary CSV download
     st.write("### Glossary Words Used in Translation:")
     df_glossary = pd.read_csv(pd.io.common.BytesIO(st.session_state["glossary_csv_bytes"]))
     st.dataframe(df_glossary, use_container_width=True)
@@ -99,6 +103,7 @@ if "translated_docx_bytes" in st.session_state:
         use_container_width=True
     )
 
+    # Non-glossary CSV download
     st.write("### Words Translated by LLM (Not in Glossary):")
     df_non_glossary = pd.read_csv(pd.io.common.BytesIO(st.session_state["non_glossary_csv_bytes"]))
     st.dataframe(df_non_glossary, use_container_width=True)
@@ -111,7 +116,7 @@ if "translated_docx_bytes" in st.session_state:
     )
 
 else:
-    if docx_file and not target_langs:
+    if uploaded_file and not target_langs:
         st.warning("Please select a target language and click 'Translate' to proceed.")
-    elif docx_file:
+    elif uploaded_file:
         st.info("Select a target language and click 'Translate' to start.")
