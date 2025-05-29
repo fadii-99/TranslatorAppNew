@@ -50,13 +50,10 @@ class DocxTranslator:
                 df = pd.read_excel(self.glossary_file_path)
             else:
                 return {}
-            # Must have columns: "Word" and "[LANG Translation]" (like "ARABIC Translation")
-            # Try to detect the translation column
             word_col = [col for col in df.columns if col.strip().lower() == "word"]
             trans_col = [col for col in df.columns if self.target_language.upper() in col.upper()]
             if not word_col or not trans_col:
                 return {}
-            # Ensure strings for matching
             return dict(zip(df[word_col[0]].astype(str).str.strip(), df[trans_col[0]].astype(str).str.strip()))
         except Exception as e:
             print(f"Error loading uploaded glossary: {e}")
@@ -87,6 +84,53 @@ class DocxTranslator:
         glossary = self.load_glossary()
         glossary_context = "\n".join([f"{word}: {translation}" for word, translation in glossary.items()])
 
+        # Tokenize the input text to find glossary words
+        def tokenize_text(text):
+            # Match single words or multi-word phrases
+            return re.findall(r'\b(?:\w+\s+\w+|\w+)\b', text.lower())
+
+        # Initialize lists for glossary and non-glossary words
+        glossary_pairs = []
+        nonglossary_pairs = []
+        
+        # Tokenize input text
+        tokenized_words = tokenize_text(text)
+        
+        # Check each tokenized word/phrase against glossary
+        for word in tokenized_words:
+            if word in glossary:
+                glossary_pairs.append((word, glossary[word]))
+                self.used_glossary_words.add(word)
+                self.used_glossary_pairs.add((word, glossary[word]))
+            else:
+                # Skip if the word is part of a multi-word glossary phrase
+                is_part_of_glossary = False
+                for gloss_word in glossary:
+                    if " " in gloss_word and word in gloss_word.split():
+                        is_part_of_glossary = True
+                        break
+                if not is_part_of_glossary:
+                    # Translate non-glossary word using LLM
+                    prompt = PromptTemplate.from_template(
+                        """
+                        Translate the following English word to {output_language} accurately and naturally.
+                        Word: {word}
+                        Your response **must** be only the translated word.
+                        """
+                    )
+                    llm = ChatOpenAI(model_name="gpt-4o", api_key=self.OPENAI_API_KEY, temperature=0.3)
+                    chain = prompt | llm
+                    try:
+                        translated_word = chain.invoke({
+                            "output_language": self.target_language,
+                            "word": word
+                        }).content.strip()
+                        nonglossary_pairs.append((word, translated_word))
+                        self.nonglossary_pairs.add((word, translated_word))
+                    except Exception as e:
+                        print(f"Error translating non-glossary word '{word}': {e}")
+                        nonglossary_pairs.append((word, word))  # Fallback to original word
+
         if self.OPENAI_API_KEY:
             prompt = PromptTemplate.from_template(
                 """
@@ -101,17 +145,7 @@ class DocxTranslator:
                 Original text ({source_language}):
                 {input}
 
-                Your response **must** follow this exact format:
-
-                Translated text ({output_language}): <translation_here>
-
-                List 1 (words used from glossary):
-                word 1, translation
-                word 2, translation
-
-                List 2 (words translated but not in glossary):
-                word 1, translation
-                word 2, translation
+                Your response **must** be only the translated text in {output_language}.
                 """
             )
             llm = ChatOpenAI(model_name="gpt-4o", api_key=self.OPENAI_API_KEY, temperature=0.3)
@@ -129,47 +163,7 @@ class DocxTranslator:
                     "input": text,
                     "glossary_context": glossary_context
                 })
-                resp = response.content.strip()
-
-                # Robust parsing of the output format
-                m = re.search(
-                    r"Translated text.*?:\s*(.*?)\n+List 1.*?:\s*(.*?)(?:\n+List 2.*?:\s*(.*))?$",
-                    resp, re.DOTALL
-                )
-                if m:
-                    translated_text = m.group(1).strip()
-                    glossary_list_raw = m.group(2).strip()
-                    nonglossary_list_raw = m.group(3).strip() if m.group(3) else ""
-
-                    glossary_pairs = []
-                    for line in glossary_list_raw.split('\n'):
-                        if ',' in line:
-                            eng, trans = [x.strip() for x in line.split(',', 1)]
-                            if eng and trans:
-                                glossary_pairs.append((eng, trans))
-                    nonglossary_pairs = []
-                    for line in nonglossary_list_raw.split('\n'):
-                        if ',' in line:
-                            eng, trans = [x.strip() for x in line.split(',', 1)]
-                            if eng and trans:
-                                nonglossary_pairs.append((eng, trans))
-                    for pair in glossary_pairs:
-                        self.used_glossary_words.add(pair[0])
-                        self.used_glossary_pairs.add(pair)
-                    for pair in nonglossary_pairs:
-                        self.nonglossary_pairs.add(pair)
-                else:
-                    # If parsing fails, try to extract Urdu/Arabic text chunks
-                    translated_text = resp
-                    if self.target_language.lower() == 'ur':
-                        urdu_text_match = re.findall(r'[\u0600-\u06FF\s,.\-؛؟]+', resp)
-                        if urdu_text_match:
-                            translated_text = ' '.join(urdu_text_match)
-                    # Add Arabic support if needed
-                    if self.target_language.lower() == 'ar':
-                        arabic_text_match = re.findall(r'[\u0600-\u06FF\s,.\-؛؟]+', resp)
-                        if arabic_text_match:
-                            translated_text = ' '.join(arabic_text_match)
+                translated_text = response.content.strip()
 
                 # If translation is an unwanted English prompt, fallback
                 unwanted_phrases = [
@@ -183,7 +177,7 @@ class DocxTranslator:
                     "please provide"
                 ]
                 if any(phrase.lower() in translated_text.lower() for phrase in unwanted_phrases):
-                    translated_text = text  # Fallback: just use the original text (or try translating with a different engine, if you want)
+                    translated_text = text  # Fallback: just use the original text
 
             except Exception as e:
                 print(f"Translation error: {e}")
@@ -194,7 +188,6 @@ class DocxTranslator:
             return text
 
         return translated_text
-
 
     def translate_xml_to_language(self, xml_path, source_lang="en", target_lang="ur", output_path=None):
         parser = etree.XMLParser(remove_blank_text=False)
@@ -218,7 +211,6 @@ class DocxTranslator:
                 except Exception as e:
                     print(f"Error translating tail text: {e}")
 
-        # RTL formatting
         if target_lang.lower() in [lang.lower() for lang in RTL_LANGUAGES]:
             for p in root.findall('.//{%s}p' % self.word_ns):
                 pPr = p.find('{%s}pPr' % self.word_ns)
