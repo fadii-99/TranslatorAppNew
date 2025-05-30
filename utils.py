@@ -9,6 +9,7 @@ from langchain_openai import ChatOpenAI
 from lxml import etree
 from dotenv import load_dotenv
 from langchain_core.prompts import PromptTemplate
+import json
 
 load_dotenv()
 
@@ -21,7 +22,7 @@ class DocxTranslator:
     def __init__(self, input_file, output_file, target_language, glossary_file_path, OPENAI_API_KEY):
         self.input_file = input_file
         self.output_file = output_file
-        self.target_language = target_language
+        self.target_language = target_language.lower()
         self.source_lang = 'English'
         self.extract_folder = tempfile.mkdtemp(prefix="docx_extract_")
         self.word_ns = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
@@ -29,18 +30,27 @@ class DocxTranslator:
         self.used_glossary_words = set()
         self.used_glossary_pairs = set()
         self.nonglossary_pairs = set()
+        self.word_report = []
         self.glossary_file_path = glossary_file_path
         self.OPENAI_API_KEY = OPENAI_API_KEY
+
+    def normalize_text(self, text):
+        """Normalize text: lowercase, remove extra spaces, keep spaces for phrases."""
+        if not text:
+            return text
+        text = re.sub(r'\s+', ' ', text.strip())
+        return text.lower()
 
     def read_document(self, file_path):
         if file_path.endswith('.docx'):
             doc = Document(file_path)
-            return '\n'.join([para.text for para in doc.paragraphs])
+            return '\n'.join([para.text for para in doc.paragraphs if para.text.strip()])
         else:
             raise ValueError("Only .docx supported.")
 
     def load_glossary(self):
         if not self.glossary_file_path or not os.path.exists(self.glossary_file_path):
+            print("No glossary file provided or file does not exist.")
             return {}
         ext = os.path.splitext(self.glossary_file_path)[1].lower()
         try:
@@ -49,14 +59,29 @@ class DocxTranslator:
             elif ext in [".xlsx", ".xls"]:
                 df = pd.read_excel(self.glossary_file_path)
             else:
+                print("Unsupported glossary file format. Expected .csv or .xlsx.")
                 return {}
-            word_col = [col for col in df.columns if col.strip().lower() == "word"]
-            trans_col = [col for col in df.columns if self.target_language.upper() in col.upper()]
+            # Look for English and target language columns
+            word_col = None
+            trans_col = None
+            for col in df.columns:
+                col_lower = col.strip().lower()
+                if col_lower in ["word", "english"]:
+                    word_col = col
+                if col_lower == self.target_language or col_lower in ["translation", "arabic", "urdu"]:
+                    trans_col = col
             if not word_col or not trans_col:
+                print(f"Glossary columns not found. Expected 'English' and '{self.target_language}' or 'translation'.")
                 return {}
-            return dict(zip(df[word_col[0]].astype(str).str.strip(), df[trans_col[0]].astype(str).str.strip()))
+            glossary = {
+                str(word).strip().lower(): str(translation).strip()
+                for word, translation in zip(df[word_col], df[trans_col])
+                if str(word).strip() and str(translation).strip() and pd.notna(word) and pd.notna(translation)
+            }
+            print(f"Loaded glossary with {len(glossary)} entries: {list(glossary.items())[:5]}...")
+            return glossary
         except Exception as e:
-            print(f"Error loading uploaded glossary: {e}")
+            print(f"Error loading glossary: {e}")
             return {}
 
     def get_used_glossary_words(self):
@@ -67,6 +92,9 @@ class DocxTranslator:
 
     def get_nonglossary_pairs(self):
         return list(self.nonglossary_pairs)
+
+    def get_word_report(self):
+        return self.word_report
 
     def extract_docx(self):
         with zipfile.ZipFile(self.input_file, 'r') as zip_ref:
@@ -80,190 +108,332 @@ class DocxTranslator:
             os.remove(self.output_file)
         os.rename(base_name + '.zip', self.output_file)
 
-    def translate_text(self, text):
-        glossary = self.load_glossary()
-        glossary_context = "\n".join([f"{word}: {translation}" for word, translation in glossary.items()])
-
-        # Tokenize the input text to find glossary words
-        def tokenize_text(text):
-            # Match single words or multi-word phrases
-            return re.findall(r'\b(?:\w+\s+\w+|\w+)\b', text.lower())
-
-        # Initialize lists for glossary and non-glossary words
-        glossary_pairs = []
-        nonglossary_pairs = []
-        
-        # Tokenize input text
-        tokenized_words = tokenize_text(text)
-        
-        # Check each tokenized word/phrase against glossary
-        for word in tokenized_words:
-            if word in glossary:
-                glossary_pairs.append((word, glossary[word]))
-                self.used_glossary_words.add(word)
-                self.used_glossary_pairs.add((word, glossary[word]))
+    def _check_glossary_in_text(self, text, glossary):
+        """Check for glossary words/phrases in text and track usage."""
+        matches = []
+        text_lower = self.normalize_text(text)
+        for gloss_word in sorted(glossary, key=lambda x: len(x), reverse=True):
+            gloss_word_lower = self.normalize_text(gloss_word)
+            # Use word boundaries for English, relaxed boundaries for Arabic/Urdu
+            if self.target_language in ['ar', 'urdu']:
+                pattern = rf'(?<!\w){re.escape(gloss_word_lower)}(?!\w)'
             else:
-                # Skip if the word is part of a multi-word glossary phrase
-                is_part_of_glossary = False
-                for gloss_word in glossary:
-                    if " " in gloss_word and word in gloss_word.split():
-                        is_part_of_glossary = True
-                        break
-                if not is_part_of_glossary:
-                    # Translate non-glossary word using LLM
-                    prompt = PromptTemplate.from_template(
-                        """
-                        Translate the following English word to {output_language} accurately and naturally.
-                        Word: {word}
-                        Your response **must** be only the translated word.
-                        """
-                    )
-                    llm = ChatOpenAI(model_name="gpt-4o", api_key=self.OPENAI_API_KEY, temperature=0.3)
-                    chain = prompt | llm
-                    try:
-                        translated_word = chain.invoke({
-                            "output_language": self.target_language,
-                            "word": word
-                        }).content.strip()
-                        nonglossary_pairs.append((word, translated_word))
-                        self.nonglossary_pairs.add((word, translated_word))
-                    except Exception as e:
-                        print(f"Error translating non-glossary word '{word}': {e}")
-                        nonglossary_pairs.append((word, word))  # Fallback to original word
+                pattern = rf'\b{re.escape(gloss_word_lower)}\b'
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                self.used_glossary_words.add(gloss_word)
+                self.used_glossary_pairs.add((gloss_word, glossary[gloss_word]))
+                matches.append((gloss_word, glossary[gloss_word]))
+                self.word_report.append({
+                    'Original Word': gloss_word,
+                    'Translated Word': glossary[gloss_word],
+                    'Source': 'Glossary',
+                    'Used in Document': 'Yes'
+                })
+        print(f"Glossary matches for text '{text[:50]}...': {matches}")
+        return matches
 
-        if self.OPENAI_API_KEY:
+    def _tokenize_words(self, text, glossary):
+        """Tokenize text into words, preserving multi-word glossary phrases."""
+        words = []
+        text_lower = self.normalize_text(text)
+        original_text = text
+        matched_positions = []
+        for gloss_word in sorted(glossary, key=lambda x: len(x), reverse=True):
+            gloss_word_lower = self.normalize_text(gloss_word)
+            if self.target_language in ['ar', 'urdu']:
+                pattern = rf'(?<!\w){re.escape(gloss_word_lower)}(?!\w)'
+            else:
+                pattern = rf'\b{re.escape(gloss_word_lower)}\b'
+            for match in re.finditer(pattern, text_lower, re.IGNORECASE):
+                start, end = match.span()
+                matched_positions.append((start, end, gloss_word, glossary[gloss_word]))
+        matched_positions.sort()
+        last_end = 0
+        for start, end, gloss_word, translation in matched_positions:
+            before_text = original_text[last_end:start]
+            if before_text:
+                words.extend(re.findall(r'\S+', before_text))
+            words.append(gloss_word)
+            last_end = end
+        if last_end < len(original_text):
+            words.extend(re.findall(r'\S+', original_text[last_end:]))
+        return words
+
+    def translate_text(self, text):
+        if not text.strip():
+            return text, [], []
+        glossary = self.load_glossary()
+
+        # Step 1: Check for glossary matches and track them
+        matches = self._check_glossary_in_text(text, glossary)
+
+        # Step 2: Replace glossary terms in the text
+        translated_text = text
+        for gloss_word in sorted(glossary, key=lambda x: len(x), reverse=True):
+            pattern = rf'(?<!\S){re.escape(gloss_word)}(?!\S)'
+            translated_text = re.sub(pattern, glossary[gloss_word], translated_text, flags=re.IGNORECASE)
+
+        # Step 3: Tokenize the original text to track non-glossary words
+        words = self._tokenize_words(text, glossary)
+        non_glossary_words = [w for w in words if w.lower() not in glossary]
+
+        # Step 4: Translate non-glossary words using LLM and get lists
+        local_glossary_pairs = []
+        local_nonglossary_pairs = []
+        if non_glossary_words:
             prompt = PromptTemplate.from_template(
                 """
                 You are a professional translator. Translate the given text from {source_language} to {output_language}.
-                Your translation must be precise, accurate, fluent, and natural-sounding in the target language, preserving the original meaning.
+                Your translations must be precise, accurate, and natural-sounding in the target language.
 
-                Use the glossary for any word if present. If not, always translate yourself. **Never reply in English, never ask for original text, and never apologize.** Every input must be translated. Do not skip or refuse.
-
-                Reference Glossary:
+                Reference Glossary (use these translations if the word matches exactly, case-insensitive):
                 {glossary_context}
 
-                Original text ({source_language}):
+                Text to translate ({source_language}):
                 {input}
 
-                Your response **must** be only the translated text in {output_language}.
+                Your response **must** be a valid JSON object with the following structure:
+                {{
+                    "translated_text": "translated text here",
+                    "glossary_pairs": [["original word", "translated word"], ...],
+                    "nonglossary_pairs": [["original word", "translated word"], ...]
+                }}
+                - "translated_text": The fully translated text. If no translation is needed, return the input text.
+                - "glossary_pairs": List of [original, translated] pairs for words found in the glossary. Return an empty list if none apply.
+                - "nonglossary_pairs": List of [original, translated] pairs for words translated by you. Return an empty list if none apply.
+                If the input text is empty or untranslatable, return an empty JSON object with the above structure.
+                Ensure the response is valid JSON with proper syntax.
                 """
             )
+            glossary_context = "\n".join([f"{word}: {translation}" for word, translation in glossary.items()])
             llm = ChatOpenAI(model_name="gpt-4o", api_key=self.OPENAI_API_KEY, temperature=0.3)
             chain = prompt | llm
 
-            try:
-                target_lang = self.target_language
-                if target_lang == "ar":
-                    target_lang = "Arabic"
-                elif target_lang == "ur":
-                    target_lang = "Urdu"
-                response = chain.invoke({
-                    "source_language": self.source_lang,
-                    "output_language": target_lang,
-                    "input": text,
-                    "glossary_context": glossary_context
-                })
-                translated_text = response.content.strip()
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    target_lang = self.target_language
+                    if target_lang == "ar":
+                        target_lang = "Arabic"
+                    elif target_lang == "ur":
+                        target_lang = "Urdu"
+                    response = chain.invoke({
+                        "source_language": self.source_lang,
+                        "output_language": target_lang,
+                        "input": text,
+                        "glossary_context": glossary_context
+                    })
+                    # Log raw response for debugging
+                    print(f"LLM Response (Attempt {attempt + 1}): {response.content}")
+                    
+                    # Clean response to handle BOM or encoding issues
+                    response_content = response.content.strip()
+                    if not response_content:
+                        print("Translation error: Empty LLM response")
+                        break
+                    
+                    # Remove BOM if present
+                    response_content = response_content.encode('utf-8').decode('utf-8-sig')
+                    
+                    # Extract JSON from Markdown code block if present
+                    json_match = re.search(r'```json\n([\s\S]*?)\n```', response_content)
+                    if json_match:
+                        response_content = json_match.group(1).strip()
+                    else:
+                        # If no Markdown wrapper, assume response is raw JSON
+                        response_content = response_content.strip()
+                    
+                    # Log the exact string being parsed
+                    print(f"Content to parse (Attempt {attempt + 1}): {repr(response_content)}")
+                    
+                    # Parse JSON response
+                    result = json.loads(response_content)
+                    
+                    # Validate JSON structure
+                    if not isinstance(result, dict) or "translated_text" not in result:
+                        print("Translation error: Invalid JSON structure")
+                        break
+                    
+                    translated_text = result.get("translated_text", translated_text)
+                    local_glossary_pairs = result.get("glossary_pairs", [])
+                    local_nonglossary_pairs = result.get("nonglossary_pairs", [])
 
-                # If translation is an unwanted English prompt, fallback
-                unwanted_phrases = [
-                    "Certainly! Please provide the original text",
-                    "please provide the original text",
-                    "I'm sorry",
-                    "cannot translate",
-                    "unable to translate",
-                    "provide more information",
-                    "not enough information",
-                    "please provide"
-                ]
-                if any(phrase.lower() in translated_text.lower() for phrase in unwanted_phrases):
-                    translated_text = text  # Fallback: just use the original text
+                    # Validate glossary pairs against loaded glossary
+                    valid_glossary_pairs = [(orig, trans) for orig, trans in local_glossary_pairs if orig.lower() in glossary and glossary[orig.lower()] == trans]
+                    for orig, trans in valid_glossary_pairs:
+                        if trans.strip() and trans != orig:
+                            self.used_glossary_pairs.add((orig, trans))
+                            self.used_glossary_words.add(orig)
+                            if not any(r['Original Word'] == orig and r['Source'] == 'Glossary' for r in self.word_report):
+                                self.word_report.append({
+                                    'Original Word': orig,
+                                    'Translated Word': trans,
+                                    'Source': 'Glossary',
+                                    'Used in Document': 'Yes'
+                                })
+                    for orig, trans in local_nonglossary_pairs:
+                        if trans.strip() and trans != orig:
+                            self.nonglossary_pairs.add((orig, trans))
+                            self.word_report.append({
+                                'Original Word': orig,
+                                'Translated Word': trans,
+                                'Source': 'LLM',
+                                'Used in Document': 'Yes'
+                            })
+                    break  # Success, exit retry loop
+                except json.JSONDecodeError as e:
+                    print(f"Translation error: JSON parsing failed: {e}")
+                    print(f"Failed content: {repr(response_content)}")
+                    if attempt == max_retries - 1:
+                        print("Max retries reached. Using glossary-based translation as fallback.")
+                        break
+                except Exception as e:
+                    print(f"Translation error: {e}")
+                    print(f"Failed content: {repr(response_content)}")
+                    if attempt == max_retries - 1:
+                        print("Max retries reached. Using glossary-based translation as fallback.")
+                        break
 
-            except Exception as e:
-                print(f"Translation error: {e}")
-                return text
-
-        else:
-            print("No OpenAI API key provided.")
-            return text
-
-        return translated_text
+        return translated_text, local_glossary_pairs, local_nonglossary_pairs
 
     def translate_xml_to_language(self, xml_path, source_lang="en", target_lang="ur", output_path=None):
         parser = etree.XMLParser(remove_blank_text=False)
         tree = etree.parse(xml_path, parser)
         root = tree.getroot()
 
-        for element in root.iter():
-            if element.text and element.text.strip():
-                original_text = element.text.strip()
-                try:
-                    translated_text = self.translate_text(original_text)
-                    element.text = translated_text
-                except Exception as e:
-                    print(f"Error translating text: {e}")
+        paragraphs = []
+        for element in root.iter(f'{{{self.word_ns}}}p'):
+            paragraph_text = ''
+            for t in element.iter(f'{{{self.word_ns}}}t'):
+                if t.text and t.text.strip():
+                    paragraph_text += t.text
+                if t.tail and t.tail.strip():
+                    paragraph_text += t.tail
+            if paragraph_text.strip():
+                paragraphs.append(paragraph_text.strip())
 
-            if element.tail and element.tail.strip():
-                original_tail = element.tail.strip()
-                try:
-                    translated_tail = self.translate_text(original_tail)
-                    element.tail = translated_tail
-                except Exception as e:
-                    print(f"Error translating tail text: {e}")
+        # Translate each paragraph and collect word pairs
+        for element in root.iter(f'{{{self.word_ns}}}p'):
+            paragraph_text = ''
+            text_elements = []
+            for t in element.iter(f'{{{self.word_ns}}}t'):
+                if t.text and t.text.strip():
+                    paragraph_text += t.text
+                    text_elements.append((t, 'text'))
+                if t.tail and t.tail.strip():
+                    paragraph_text += t.tail
+                    text_elements.append((t, 'tail'))
 
+            if paragraph_text.strip():
+                translated_text, gloss_pairs, nongloss_pairs = self.translate_text(paragraph_text)
+                # Distribute translated text back to elements
+                for t, t_type in text_elements:
+                    if t_type == 'text' and t.text.strip():
+                        t.text = translated_text
+                        translated_text = ''  # Use once
+                    elif t_type == 'tail' and t.tail.strip():
+                        t.tail = translated_text
+                        translated_text = ''  # Use once
+
+        # Apply RTL settings for Urdu/Arabic
         if target_lang.lower() in [lang.lower() for lang in RTL_LANGUAGES]:
-            for p in root.findall('.//{%s}p' % self.word_ns):
-                pPr = p.find('{%s}pPr' % self.word_ns)
+            for p in root.findall(f'.//{{{self.word_ns}}}p'):
+                pPr = p.find(f'{{{self.word_ns}}}pPr')
                 if pPr is None:
-                    pPr = etree.SubElement(p, '{%s}pPr' % self.word_ns)
-                if pPr.find('{%s}bidi' % self.word_ns) is None:
-                    bidi = etree.SubElement(pPr, '{%s}bidi' % self.word_ns)
-                jc = pPr.find('{%s}jc' % self.word_ns)
+                    pPr = etree.SubElement(p, f'{{{self.word_ns}}}pPr')
+                
+                # Set paragraph direction to RTL
+                bidi = pPr.find(f'{{{self.word_ns}}}bidi')
+                if bidi is None:
+                    bidi = etree.SubElement(pPr, f'{{{self.word_ns}}}bidi')
+                bidi.set(f'{{{self.word_ns}}}val', "1")
+                
+                # Set text alignment to right
+                jc = pPr.find(f'{{{self.word_ns}}}jc')
                 if jc is None:
-                    jc = etree.SubElement(pPr, '{%s}jc' % self.word_ns)
-                jc.set('{%s}val' % self.word_ns, 'right')
-                for r in p.findall('.//{%s}r' % self.word_ns):
-                    rPr = r.find('{%s}rPr' % self.word_ns)
+                    jc = etree.SubElement(pPr, f'{{{self.word_ns}}}jc')
+                jc.set(f'{{{self.word_ns}}}val', 'right')
+                
+                # Set text direction
+                textDirection = pPr.find(f'{{{self.word_ns}}}textDirection')
+                if textDirection is None:
+                    textDirection = etree.SubElement(pPr, f'{{{self.word_ns}}}textDirection')
+                textDirection.set(f'{{{self.word_ns}}}val', 'rtl')
+                
+                for r in p.findall(f'.//{{{self.word_ns}}}r'):
+                    rPr = r.find(f'{{{self.word_ns}}}rPr')
                     if rPr is None:
-                        rPr = etree.SubElement(r, '{%s}rPr' % self.word_ns)
-                    if rPr.find('{%s}bidi' % self.word_ns) is None:
-                        bidi = etree.SubElement(rPr, '{%s}bidi' % self.word_ns)
-                    lang = rPr.find('{%s}lang' % self.word_ns)
+                        rPr = etree.SubElement(r, f'{{{self.word_ns}}}rPr')
+                    
+                    # Set run direction to RTL
+                    rtl = rPr.find(f'{{{self.word_ns}}}rtl')
+                    if rtl is None:
+                        rtl = etree.SubElement(rPr, f'{{{self.word_ns}}}rtl')
+                    rtl.set(f'{{{self.word_ns}}}val', "1")
+                    
+                    # Set bidirectional property
+                    bidi = rPr.find(f'{{{self.word_ns}}}bidi')
+                    if bidi is None:
+                        bidi = etree.SubElement(rPr, f'{{{self.word_ns}}}bidi')
+                    
+                    # Set language
+                    lang = rPr.find(f'{{{self.word_ns}}}lang')
                     if lang is None:
-                        lang = etree.SubElement(rPr, '{%s}lang' % self.word_ns)
-                    lang.set('{%s}val' % self.word_ns, 'ur-PK' if target_lang.lower() == 'ur' else 'ar-SA')
-                    font = rPr.find('{%s}rFonts' % self.word_ns)
+                        lang = etree.SubElement(rPr, f'{{{self.word_ns}}}lang')
+                    lang.set(f'{{{self.word_ns}}}val', 'ur-PK' if target_lang.lower() == 'ur' else 'ar-SA')
+                    lang.set(f'{{{self.word_ns}}}bidi', 'ur-PK' if target_lang.lower() == 'ur' else 'ar-SA')
+                    
+                    # Set fonts
+                    font = rPr.find(f'{{{self.word_ns}}}rFonts')
                     if font is None:
-                        font = etree.SubElement(rPr, '{%s}rFonts' % self.word_ns)
+                        font = etree.SubElement(rPr, f'{{{self.word_ns}}}rFonts')
                     if target_lang.lower() == 'ur':
-                        font.set('{%s}ascii' % self.word_ns, 'Jameel Noori Nastaleeq')
-                        font.set('{%s}hAnsi' % self.word_ns, 'Jameel Noori Nastaleeq')
+                        font.set(f'{{{self.word_ns}}}ascii', 'Jameel Noori Nastaleeq')
+                        font.set(f'{{{self.word_ns}}}hAnsi', 'Jameel Noori Nastaleeq')
+                        font.set(f'{{{self.word_ns}}}cs', 'Jameel Noori Nastaleeq')
+                        font.set(f'{{{self.word_ns}}}bidi', 'Jameel Noori Nastaleeq')
                     else:
-                        font.set('{%s}ascii' % self.word_ns, 'Amiri')
-                        font.set('{%s}hAnsi' % self.word_ns, 'Amiri')
+                        font.set(f'{{{self.word_ns}}}ascii', 'Amiri')
+                        font.set(f'{{{self.word_ns}}}hAnsi', 'Amiri')
+                        font.set(f'{{{self.word_ns}}}cs', 'Noto Naskh Arabic')
+                        font.set(f'{{{self.word_ns}}}bidi', 'Amiri')
 
-        if target_lang.lower() in [lang.lower() for lang in RTL_LANGUAGES]:
             settings_path = os.path.join(self.extract_folder, "word", "settings.xml")
             if os.path.exists(settings_path):
                 settings_tree = etree.parse(settings_path, parser)
                 settings_root = settings_tree.getroot()
-                lang = settings_root.find('.//{%s}lang' % self.word_ns)
+                lang = settings_root.find(f'.//{{{self.word_ns}}}lang')
                 if lang is None:
-                    lang = etree.SubElement(settings_root, '{%s}lang' % self.word_ns)
-                lang.set('{%s}val' % self.word_ns, 'ur-PK' if target_lang.lower() == 'ur' else 'ar-SA')
-                cs = settings_root.find('.//{%s}compatSetting[@name="useFELayout"]' % self.word_ns)
+                    lang = etree.SubElement(settings_root, f'{{{self.word_ns}}}lang')
+                lang.set(f'{{{self.word_ns}}}val', 'ur-PK' if target_lang.lower() == 'ur' else 'ar-SA')
+                cs = settings_root.find(f'.//{{{self.word_ns}}}compatSetting[@name="useFELayout"]')
                 if cs is None:
-                    compat = settings_root.find('{%s}compat' % self.word_ns)
+                    compat = settings_root.find(f'{{{self.word_ns}}}compat')
                     if compat is None:
-                        compat = etree.SubElement(settings_root, '{%s}compat' % self.word_ns)
-                    cs = etree.SubElement(compat, '{%s}compatSetting' % self.word_ns)
-                    cs.set('{%s}name' % self.word_ns, 'useFELayout')
-                    cs.set('{%s}uri' % self.word_ns, 'http://schemas.microsoft.com/office/word')
-                    cs.set('{%s}val' % self.word_ns, '1')
+                        compat = etree.SubElement(settings_root, f'{{{self.word_ns}}}compat')
+                    cs = etree.SubElement(compat, f'{{{self.word_ns}}}compatSetting')
+                    cs.set(f'{{{self.word_ns}}}name', 'useFELayout')
+                    cs.set(f'{{{self.word_ns}}}uri', 'http://schemas.microsoft.com/office/word')
+                    cs.set(f'{{{self.word_ns}}}val', '1')
                 settings_tree.write(settings_path, encoding='utf-8', xml_declaration=True, pretty_print=True)
 
         if output_path:
             tree.write(output_path, encoding='utf-8', xml_declaration=True, pretty_print=True)
+
+    def generate_usage_report(self):
+        glossary = self.load_glossary()
+        used_words = set(self.used_glossary_words)
+        for word, translation in glossary.items():
+            if word not in used_words and not any(
+                r['Original Word'] == word and r['Source'] == 'Glossary' for r in self.word_report
+            ):
+                self.word_report.append({
+                    'Original Word': word,
+                    'Translated Word': translation,
+                    'Source': 'Glossary',
+                    'Used in Document': 'No'
+                })
+        return self.word_report
 
     def run(self):
         if os.path.exists(self.extract_folder):
@@ -277,9 +447,15 @@ class DocxTranslator:
             xml_path = self.extract_docx()
             self.translate_xml_to_language(xml_path, source_lang="en", target_lang=self.target_language, output_path=xml_path)
             self.create_translated_docx()
+            report = self.generate_usage_report()
+            report_df = pd.DataFrame(report)
+            report_df.to_csv("word_by_word_report.csv", index=False, encoding='utf-8')
             print(f"Translation complete! Saved as: {self.output_file}")
+            print(f"Word-by-word report saved as: word_by_word_report.csv")
+            return report, self.get_used_glossary_pairs(), self.get_nonglossary_pairs()
         except Exception as e:
             print(f"Error during DOCX translation: {e}")
+            return [], [], []
         finally:
             if os.path.exists(self.extract_folder):
                 try:
@@ -293,8 +469,5 @@ def translate_file(input_file, output_file, target_language, glossary_file_path,
         translator = DocxTranslator(input_file, output_file, target_language, glossary_file_path, OPENAI_API_KEY)
     else:
         raise ValueError(f"Unsupported file type: {file_extension}. Please use .docx")
-    translator.run()
-    used_glossary = translator.get_used_glossary_words()
-    used_glossary_pairs = translator.get_used_glossary_pairs()
-    nonglossary_pairs = translator.get_nonglossary_pairs()
-    return used_glossary, used_glossary_pairs, nonglossary_pairs
+    report, used_glossary_pairs, nonglossary_pairs = translator.run()
+    return report, used_glossary_pairs, nonglossary_pairs
