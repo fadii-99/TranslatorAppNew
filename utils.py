@@ -301,18 +301,7 @@ class DocxTranslator:
         tree = etree.parse(xml_path, parser)
         root = tree.getroot()
 
-        paragraphs = []
-        for element in root.iter(f'{{{self.word_ns}}}p'):
-            paragraph_text = ''
-            for t in element.iter(f'{{{self.word_ns}}}t'):
-                if t.text and t.text.strip():
-                    paragraph_text += t.text
-                if t.tail and t.tail.strip():
-                    paragraph_text += t.tail
-            if paragraph_text.strip():
-                paragraphs.append(paragraph_text.strip())
-
-        # Translate each paragraph and collect word pairs
+        # 1. Translate each paragraph's text
         for element in root.iter(f'{{{self.word_ns}}}p'):
             paragraph_text = ''
             text_elements = []
@@ -323,67 +312,64 @@ class DocxTranslator:
                 if t.tail and t.tail.strip():
                     paragraph_text += t.tail
                     text_elements.append((t, 'tail'))
-
             if paragraph_text.strip():
                 translated_text, gloss_pairs, nongloss_pairs = self.translate_text(paragraph_text)
-                # Distribute translated text back to elements
                 for t, t_type in text_elements:
                     if t_type == 'text' and t.text.strip():
                         t.text = translated_text
-                        translated_text = ''  # Use once
+                        translated_text = ''
                     elif t_type == 'tail' and t.tail.strip():
                         t.tail = translated_text
-                        translated_text = ''  # Use once
+                        translated_text = ''
 
-        # Apply RTL settings for Urdu/Arabic
+        # 2. Force RTL and right-aligned formatting if needed
         if target_lang.lower() in [lang.lower() for lang in RTL_LANGUAGES]:
             for p in root.findall(f'.//{{{self.word_ns}}}p'):
                 pPr = p.find(f'{{{self.word_ns}}}pPr')
                 if pPr is None:
                     pPr = etree.SubElement(p, f'{{{self.word_ns}}}pPr')
-                
-                # Set paragraph direction to RTL
+
+                # Set bidi property
                 bidi = pPr.find(f'{{{self.word_ns}}}bidi')
                 if bidi is None:
                     bidi = etree.SubElement(pPr, f'{{{self.word_ns}}}bidi')
                 bidi.set(f'{{{self.word_ns}}}val', "1")
-                
-                # Set text alignment to right
+
+                # Set right alignment
                 jc = pPr.find(f'{{{self.word_ns}}}jc')
                 if jc is None:
                     jc = etree.SubElement(pPr, f'{{{self.word_ns}}}jc')
                 jc.set(f'{{{self.word_ns}}}val', 'right')
-                
-                # Set text direction
+
+                # Remove textDirection if present (NOT needed for Urdu/Arabic)
                 textDirection = pPr.find(f'{{{self.word_ns}}}textDirection')
-                if textDirection is None:
-                    textDirection = etree.SubElement(pPr, f'{{{self.word_ns}}}textDirection')
-                textDirection.set(f'{{{self.word_ns}}}val', 'rtl')
-                
+                if textDirection is not None:
+                    pPr.remove(textDirection)
+
                 for r in p.findall(f'.//{{{self.word_ns}}}r'):
                     rPr = r.find(f'{{{self.word_ns}}}rPr')
                     if rPr is None:
                         rPr = etree.SubElement(r, f'{{{self.word_ns}}}rPr')
-                    
-                    # Set run direction to RTL
+
+                    # Set run RTL
                     rtl = rPr.find(f'{{{self.word_ns}}}rtl')
                     if rtl is None:
                         rtl = etree.SubElement(rPr, f'{{{self.word_ns}}}rtl')
                     rtl.set(f'{{{self.word_ns}}}val', "1")
-                    
-                    # Set bidirectional property
-                    bidi = rPr.find(f'{{{self.word_ns}}}bidi')
-                    if bidi is None:
-                        bidi = etree.SubElement(rPr, f'{{{self.word_ns}}}bidi')
-                    
+
+                    # Set bidi on run
+                    rbidi = rPr.find(f'{{{self.word_ns}}}bidi')
+                    if rbidi is None:
+                        rbidi = etree.SubElement(rPr, f'{{{self.word_ns}}}bidi')
+
                     # Set language
                     lang = rPr.find(f'{{{self.word_ns}}}lang')
                     if lang is None:
                         lang = etree.SubElement(rPr, f'{{{self.word_ns}}}lang')
                     lang.set(f'{{{self.word_ns}}}val', 'ur-PK' if target_lang.lower() == 'ur' else 'ar-SA')
                     lang.set(f'{{{self.word_ns}}}bidi', 'ur-PK' if target_lang.lower() == 'ur' else 'ar-SA')
-                    
-                    # Set fonts
+
+                    # Set font for Urdu/Arabic
                     font = rPr.find(f'{{{self.word_ns}}}rFonts')
                     if font is None:
                         font = etree.SubElement(rPr, f'{{{self.word_ns}}}rFonts')
@@ -398,6 +384,7 @@ class DocxTranslator:
                         font.set(f'{{{self.word_ns}}}cs', 'Noto Naskh Arabic')
                         font.set(f'{{{self.word_ns}}}bidi', 'Amiri')
 
+            # 3. Optionally update settings.xml for document-wide RTL
             settings_path = os.path.join(self.extract_folder, "word", "settings.xml")
             if os.path.exists(settings_path):
                 settings_tree = etree.parse(settings_path, parser)
@@ -406,19 +393,21 @@ class DocxTranslator:
                 if lang is None:
                     lang = etree.SubElement(settings_root, f'{{{self.word_ns}}}lang')
                 lang.set(f'{{{self.word_ns}}}val', 'ur-PK' if target_lang.lower() == 'ur' else 'ar-SA')
-                cs = settings_root.find(f'.//{{{self.word_ns}}}compatSetting[@name="useFELayout"]')
+                compat = settings_root.find(f'{{{self.word_ns}}}compat')
+                if compat is None:
+                    compat = etree.SubElement(settings_root, f'{{{self.word_ns}}}compat')
+                cs = compat.find(f'{{{self.word_ns}}}compatSetting[@w:name="useFELayout"]', namespaces={'w': self.word_ns})
                 if cs is None:
-                    compat = settings_root.find(f'{{{self.word_ns}}}compat')
-                    if compat is None:
-                        compat = etree.SubElement(settings_root, f'{{{self.word_ns}}}compat')
                     cs = etree.SubElement(compat, f'{{{self.word_ns}}}compatSetting')
                     cs.set(f'{{{self.word_ns}}}name', 'useFELayout')
                     cs.set(f'{{{self.word_ns}}}uri', 'http://schemas.microsoft.com/office/word')
-                    cs.set(f'{{{self.word_ns}}}val', '1')
+                cs.set(f'{{{self.word_ns}}}val', '1')
                 settings_tree.write(settings_path, encoding='utf-8', xml_declaration=True, pretty_print=True)
 
+        # 4. Save output
         if output_path:
             tree.write(output_path, encoding='utf-8', xml_declaration=True, pretty_print=True)
+
 
     def generate_usage_report(self):
         glossary = self.load_glossary()
