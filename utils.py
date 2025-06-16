@@ -97,16 +97,203 @@ class DocxTranslator:
         return self.word_report
 
     def extract_docx(self):
-        with zipfile.ZipFile(self.input_file, 'r') as zip_ref:
+        zip_input_file = self.input_file.replace('.docx', '.zip')
+        if os.path.exists(zip_input_file):
+            os.remove(zip_input_file)
+        os.rename(self.input_file, zip_input_file)
+        with zipfile.ZipFile(zip_input_file, 'r') as zip_ref:
             zip_ref.extractall(self.extract_folder)
-        return os.path.join(self.extract_folder, "word", "document.xml")
+        print("Extracted files and directories:")
+        for root, dirs, files in os.walk(self.extract_folder):
+            for name in files:
+                print(os.path.join(root, name))
+        document_xml = os.path.join(self.extract_folder, "word", "document.xml")
+        if not os.path.exists(document_xml):
+            print("ERROR: document.xml not found after extraction.")
+            raise FileNotFoundError(f"document.xml not found in extracted folder: {document_xml}")
+        return document_xml, zip_input_file
 
-    def create_translated_docx(self):
-        base_name = self.output_file.replace('.docx', '')
-        shutil.make_archive(base_name, 'zip', self.extract_folder)
+
+
+    def create_translated_docx(self, zip_input_file):
+        # Create new zip from the extracted contents
+        zip_output_file = self.output_file.replace('.docx', '.zip')
+        if os.path.exists(zip_output_file):
+            os.remove(zip_output_file)
+        with zipfile.ZipFile(zip_output_file, 'w', zipfile.ZIP_DEFLATED) as docx_zip:
+            for foldername, subfolders, filenames in os.walk(self.extract_folder):
+                for filename in filenames:
+                    file_path = os.path.join(foldername, filename)
+                    arcname = os.path.relpath(file_path, self.extract_folder)
+                    docx_zip.write(file_path, arcname)
+        # Step: Rename .zip back to .docx
         if os.path.exists(self.output_file):
             os.remove(self.output_file)
-        os.rename(base_name + '.zip', self.output_file)
+        os.rename(zip_output_file, self.output_file)
+        # Cleanup: Optionally delete the old input zip if you want
+        if os.path.exists(zip_input_file):
+            os.remove(zip_input_file)
+
+    def patch_styles_for_urdu(self):
+        styles_path = os.path.join(self.extract_folder, "word", "styles.xml")
+        if not os.path.exists(styles_path):
+            print("styles.xml not found, skipping style patch.")
+            return
+        parser = etree.XMLParser(remove_blank_text=False)
+        tree = etree.parse(styles_path, parser)
+        root = tree.getroot()
+        ns = {'w': self.word_ns}
+
+        # Patch Normal and Heading1 styles
+        for style_id in ["Normal", "Heading1"]:
+            style = root.find(f'.//w:style[@w:styleId="{style_id}"]', namespaces=ns)
+            if style is not None:
+                # Paragraph props
+                pPr = style.find('w:pPr', namespaces=ns)
+                if pPr is None:
+                    pPr = etree.SubElement(style, f'{{{self.word_ns}}}pPr')
+                # Right align
+                jc = pPr.find('w:jc', namespaces=ns)
+                if jc is None:
+                    jc = etree.SubElement(pPr, f'{{{self.word_ns}}}jc')
+                jc.set(f'{{{self.word_ns}}}val', 'right')
+                # Bidi
+                bidi = pPr.find('w:bidi', namespaces=ns)
+                if bidi is None:
+                    bidi = etree.SubElement(pPr, f'{{{self.word_ns}}}bidi')
+                bidi.set(f'{{{self.word_ns}}}val', "1")
+                # Run props
+                rPr = style.find('w:rPr', namespaces=ns)
+                if rPr is None:
+                    rPr = etree.SubElement(style, f'{{{self.word_ns}}}rPr')
+                rFonts = rPr.find('w:rFonts', namespaces=ns)
+                if rFonts is None:
+                    rFonts = etree.SubElement(rPr, f'{{{self.word_ns}}}rFonts')
+                rFonts.set(f'{{{self.word_ns}}}ascii', 'Jameel Noori Nastaleeq')
+                rFonts.set(f'{{{self.word_ns}}}hAnsi', 'Jameel Noori Nastaleeq')
+                rFonts.set(f'{{{self.word_ns}}}cs', 'Jameel Noori Nastaleeq')
+                rFonts.set(f'{{{self.word_ns}}}bidi', 'Jameel Noori Nastaleeq')
+                lang = rPr.find('w:lang', namespaces=ns)
+                if lang is None:
+                    lang = etree.SubElement(rPr, f'{{{self.word_ns}}}lang')
+                lang.set(f'{{{self.word_ns}}}val', 'ur-PK')
+                lang.set(f'{{{self.word_ns}}}bidi', 'ur-PK')
+        tree.write(styles_path, encoding='utf-8', xml_declaration=True, pretty_print=True)
+        print("styles.xml patched for Urdu RTL.")
+
+
+    def patch_settings_for_urdu(self):
+        settings_path = os.path.join(self.extract_folder, "word", "settings.xml")
+        if not os.path.exists(settings_path):
+            print("settings.xml not found, skipping settings patch.")
+            return
+        parser = etree.XMLParser(remove_blank_text=False)
+        tree = etree.parse(settings_path, parser)
+        root = tree.getroot()
+        lang = root.find(f'.//{{{self.word_ns}}}lang')
+        if lang is None:
+            lang = etree.SubElement(root, f'{{{self.word_ns}}}lang')
+        lang.set(f'{{{self.word_ns}}}val', 'ur-PK')
+        lang.set(f'{{{self.word_ns}}}bidi', 'ur-PK')
+        compat = root.find(f'{{{self.word_ns}}}compat')
+        if compat is None:
+            compat = etree.SubElement(root, f'{{{self.word_ns}}}compat')
+        cs = compat.find(f'{{{self.word_ns}}}compatSetting[@w:name="useFELayout"]', namespaces={'w': self.word_ns})
+        if cs is None:
+            cs = etree.SubElement(compat, f'{{{self.word_ns}}}compatSetting')
+            cs.set(f'{{{self.word_ns}}}name', 'useFELayout')
+            cs.set(f'{{{self.word_ns}}}uri', 'http://schemas.microsoft.com/office/word')
+        cs.set(f'{{{self.word_ns}}}val', '1')
+        tree.write(settings_path, encoding='utf-8', xml_declaration=True, pretty_print=True)
+        print("settings.xml patched for Urdu RTL.")
+
+
+    def fix_bidi_lang_in_styles(self):
+        styles_path = os.path.join(self.extract_folder, "word", "styles.xml")
+        if not os.path.exists(styles_path):
+            print("styles.xml not found.")
+            return
+        parser = etree.XMLParser(remove_blank_text=False)
+        tree = etree.parse(styles_path, parser)
+        root = tree.getroot()
+        changed = False
+        for lang_elem in root.iter(f'{{{self.word_ns}}}lang'):
+            val = lang_elem.get(f'{{{self.word_ns}}}val')
+            bidi = lang_elem.get(f'{{{self.word_ns}}}bidi')
+            # If it's set to en-US/ar-SA, change it to ur-PK/ur-PK
+            if val == "en-US" and bidi == "ar-SA":
+                lang_elem.set(f'{{{self.word_ns}}}val', "ur-PK")
+                lang_elem.set(f'{{{self.word_ns}}}bidi', "ur-PK")
+                changed = True
+        # As a fallback: if any <w:lang> has bidi="ar-SA", set to ur-PK
+        for lang_elem in root.iter(f'{{{self.word_ns}}}lang'):
+            if lang_elem.get(f'{{{self.word_ns}}}bidi') == "ar-SA":
+                lang_elem.set(f'{{{self.word_ns}}}bidi', "ur-PK")
+                changed = True
+        if changed:
+            tree.write(styles_path, encoding='utf-8', xml_declaration=True, pretty_print=True)
+            print("styles.xml bidi language fixed for Urdu.")
+        else:
+            print("No bidi language to fix in styles.xml.")
+
+
+    def force_all_rtl(self, root):
+    # For every paragraph
+        for p in root.iter(f'{{{self.word_ns}}}p'):
+            # Paragraph properties
+            pPr = p.find(f'{{{self.word_ns}}}pPr')
+            if pPr is None:
+                pPr = etree.SubElement(p, f'{{{self.word_ns}}}pPr')
+
+            # Set right alignment
+            jc = pPr.find(f'{{{self.word_ns}}}jc')
+            if jc is None:
+                jc = etree.SubElement(pPr, f'{{{self.word_ns}}}jc')
+            jc.set(f'{{{self.word_ns}}}val', 'right')
+
+            # Set paragraph bidi (RTL)
+            bidi = pPr.find(f'{{{self.word_ns}}}bidi')
+            if bidi is None:
+                bidi = etree.SubElement(pPr, f'{{{self.word_ns}}}bidi')
+            bidi.set(f'{{{self.word_ns}}}val', "1")
+
+            # Remove textDirection if present
+            textDirection = pPr.find(f'{{{self.word_ns}}}textDirection')
+            if textDirection is not None:
+                pPr.remove(textDirection)
+
+            # For every run in this paragraph
+            for r in p.findall(f'.//{{{self.word_ns}}}r'):
+                rPr = r.find(f'{{{self.word_ns}}}rPr')
+                if rPr is None:
+                    rPr = etree.SubElement(r, f'{{{self.word_ns}}}rPr')
+
+                # Set run RTL
+                rtl = rPr.find(f'{{{self.word_ns}}}rtl')
+                if rtl is None:
+                    rtl = etree.SubElement(rPr, f'{{{self.word_ns}}}rtl')
+                rtl.set(f'{{{self.word_ns}}}val', "1")
+
+                # Set bidi on run
+                rbidi = rPr.find(f'{{{self.word_ns}}}bidi')
+                if rbidi is None:
+                    rbidi = etree.SubElement(rPr, f'{{{self.word_ns}}}bidi')
+                rbidi.set(f'{{{self.word_ns}}}val', "1")
+
+                # Set language and font for Urdu
+                lang = rPr.find(f'{{{self.word_ns}}}lang')
+                if lang is None:
+                    lang = etree.SubElement(rPr, f'{{{self.word_ns}}}lang')
+                lang.set(f'{{{self.word_ns}}}val', 'ur-PK')
+                lang.set(f'{{{self.word_ns}}}bidi', 'ur-PK')
+                font = rPr.find(f'{{{self.word_ns}}}rFonts')
+                if font is None:
+                    font = etree.SubElement(rPr, f'{{{self.word_ns}}}rFonts')
+                font.set(f'{{{self.word_ns}}}ascii', 'Jameel Noori Nastaleeq')
+                font.set(f'{{{self.word_ns}}}hAnsi', 'Jameel Noori Nastaleeq')
+                font.set(f'{{{self.word_ns}}}cs', 'Jameel Noori Nastaleeq')
+                font.set(f'{{{self.word_ns}}}bidi', 'Jameel Noori Nastaleeq')
+
 
     def _check_glossary_in_text(self, text, glossary):
         """Check for glossary words/phrases in text and track usage."""
@@ -324,85 +511,11 @@ class DocxTranslator:
 
         # 2. Force RTL and right-aligned formatting if needed
         if target_lang.lower() in [lang.lower() for lang in RTL_LANGUAGES]:
-            for p in root.findall(f'.//{{{self.word_ns}}}p'):
-                pPr = p.find(f'{{{self.word_ns}}}pPr')
-                if pPr is None:
-                    pPr = etree.SubElement(p, f'{{{self.word_ns}}}pPr')
+            self.force_all_rtl(root)
+            self.patch_styles_for_urdu()
+            self.patch_settings_for_urdu()
+            self.fix_bidi_lang_in_styles()
 
-                # Set bidi property
-                bidi = pPr.find(f'{{{self.word_ns}}}bidi')
-                if bidi is None:
-                    bidi = etree.SubElement(pPr, f'{{{self.word_ns}}}bidi')
-                bidi.set(f'{{{self.word_ns}}}val', "1")
-
-                # Set right alignment
-                jc = pPr.find(f'{{{self.word_ns}}}jc')
-                if jc is None:
-                    jc = etree.SubElement(pPr, f'{{{self.word_ns}}}jc')
-                jc.set(f'{{{self.word_ns}}}val', 'right')
-
-                # Remove textDirection if present (NOT needed for Urdu/Arabic)
-                textDirection = pPr.find(f'{{{self.word_ns}}}textDirection')
-                if textDirection is not None:
-                    pPr.remove(textDirection)
-
-                for r in p.findall(f'.//{{{self.word_ns}}}r'):
-                    rPr = r.find(f'{{{self.word_ns}}}rPr')
-                    if rPr is None:
-                        rPr = etree.SubElement(r, f'{{{self.word_ns}}}rPr')
-
-                    # Set run RTL
-                    rtl = rPr.find(f'{{{self.word_ns}}}rtl')
-                    if rtl is None:
-                        rtl = etree.SubElement(rPr, f'{{{self.word_ns}}}rtl')
-                    rtl.set(f'{{{self.word_ns}}}val', "1")
-
-                    # Set bidi on run
-                    rbidi = rPr.find(f'{{{self.word_ns}}}bidi')
-                    if rbidi is None:
-                        rbidi = etree.SubElement(rPr, f'{{{self.word_ns}}}bidi')
-
-                    # Set language
-                    lang = rPr.find(f'{{{self.word_ns}}}lang')
-                    if lang is None:
-                        lang = etree.SubElement(rPr, f'{{{self.word_ns}}}lang')
-                    lang.set(f'{{{self.word_ns}}}val', 'ur-PK' if target_lang.lower() == 'ur' else 'ar-SA')
-                    lang.set(f'{{{self.word_ns}}}bidi', 'ur-PK' if target_lang.lower() == 'ur' else 'ar-SA')
-
-                    # Set font for Urdu/Arabic
-                    font = rPr.find(f'{{{self.word_ns}}}rFonts')
-                    if font is None:
-                        font = etree.SubElement(rPr, f'{{{self.word_ns}}}rFonts')
-                    if target_lang.lower() == 'ur':
-                        font.set(f'{{{self.word_ns}}}ascii', 'Jameel Noori Nastaleeq')
-                        font.set(f'{{{self.word_ns}}}hAnsi', 'Jameel Noori Nastaleeq')
-                        font.set(f'{{{self.word_ns}}}cs', 'Jameel Noori Nastaleeq')
-                        font.set(f'{{{self.word_ns}}}bidi', 'Jameel Noori Nastaleeq')
-                    else:
-                        font.set(f'{{{self.word_ns}}}ascii', 'Amiri')
-                        font.set(f'{{{self.word_ns}}}hAnsi', 'Amiri')
-                        font.set(f'{{{self.word_ns}}}cs', 'Noto Naskh Arabic')
-                        font.set(f'{{{self.word_ns}}}bidi', 'Amiri')
-
-            # 3. Optionally update settings.xml for document-wide RTL
-            settings_path = os.path.join(self.extract_folder, "word", "settings.xml")
-            if os.path.exists(settings_path):
-                settings_tree = etree.parse(settings_path, parser)
-                settings_root = settings_tree.getroot()
-                lang = settings_root.find(f'.//{{{self.word_ns}}}lang')
-                if lang is None:
-                    lang = etree.SubElement(settings_root, f'{{{self.word_ns}}}lang')
-                lang.set(f'{{{self.word_ns}}}val', 'ur-PK' if target_lang.lower() == 'ur' else 'ar-SA')
-                compat = settings_root.find(f'{{{self.word_ns}}}compat')
-                if compat is None:
-                    compat = etree.SubElement(settings_root, f'{{{self.word_ns}}}compat')
-                cs = compat.find(f'{{{self.word_ns}}}compatSetting[@w:name="useFELayout"]', namespaces={'w': self.word_ns})
-                if cs is None:
-                    cs = etree.SubElement(compat, f'{{{self.word_ns}}}compatSetting')
-                    cs.set(f'{{{self.word_ns}}}name', 'useFELayout')
-                    cs.set(f'{{{self.word_ns}}}uri', 'http://schemas.microsoft.com/office/word')
-                cs.set(f'{{{self.word_ns}}}val', '1')
-                settings_tree.write(settings_path, encoding='utf-8', xml_declaration=True, pretty_print=True)
 
         # 4. Save output
         if output_path:
@@ -433,9 +546,9 @@ class DocxTranslator:
         os.makedirs(self.extract_folder, exist_ok=True)
 
         try:
-            xml_path = self.extract_docx()
+            xml_path, zip_input_file = self.extract_docx()
             self.translate_xml_to_language(xml_path, source_lang="en", target_lang=self.target_language, output_path=xml_path)
-            self.create_translated_docx()
+            self.create_translated_docx(zip_input_file)
             report = self.generate_usage_report()
             report_df = pd.DataFrame(report)
             report_df.to_csv("word_by_word_report.csv", index=False, encoding='utf-8')
