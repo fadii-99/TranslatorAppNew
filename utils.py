@@ -1,395 +1,221 @@
-import os
-import zipfile
-import shutil
-import tempfile
-import re
+# utils.py  –  full module with numbered-list Arabic digit support
+import os, zipfile, shutil, tempfile, re, json
 import pandas as pd
-from docx import Document
-from langchain_openai import ChatOpenAI
 from lxml import etree
 from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
 from langchain_core.prompts import PromptTemplate
-import json
 
 load_dotenv()
 
+# ─────────────────────────  RTL helpers ─────────────────────────
 RTL_LANGUAGES = {
-    "Arabic", "Hebrew", "Persian", "Urdu", "Yiddish",
-    "Pashto", "Sindhi", "Dhivehi", "Kurdish", "ur", "ar"
+    "arabic","hebrew","persian","urdu","yiddish",
+    "pashto","sindhi","dhivehi","kurdish","ur","ar"
 }
+def normalize_rtl_punctuation(txt:str)->str:
+    mapping={'.':'۔',',':'،',';':'؛','?':'؟','!':'！',
+             '(':'﴾',')':'﴿','[':'〚',']':'〛',':':'：',
+             '%':'٪','-':'–'}
+    for a,b in mapping.items():
+        txt=txt.replace(a,b)
+    return txt
+# ----------------------------------------------------------------
+
+# ───── prefix & digit helpers ─────
+RLM='\u200F'
+_PREFIX_RE=re.compile(r"""^(\s*(?:[\u2022•\-\u25CF·]|\d+[\.\)\-:])\s*)""",re.VERBOSE)
+_ARABIC_DIGITS=str.maketrans("0123456789","٠١٢٣٤٥٦٧٨٩")
+
+def split_prefix(line:str):
+    m=_PREFIX_RE.match(line)
+    return (m.group(1),line[m.end():].lstrip()) if m else ('',line)
+
+def to_arabic_prefix(p:str)->str:
+    return p.translate(_ARABIC_DIGITS).replace('.', '۔')
+# ----------------------------------
 
 class DocxTranslator:
-    def __init__(self, input_file, output_file, target_language, glossary_file_path, OPENAI_API_KEY):
-        self.input_file = input_file
-        self.output_file = output_file
-        self.target_language = target_language.lower()
-        self.source_lang = 'English'
-        self.extract_folder = tempfile.mkdtemp(prefix="docx_extract_")
-        self.word_ns = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-        self.translations_cache = {}
-        self.used_glossary_words = set()
-        self.used_glossary_pairs = set()
-        self.nonglossary_pairs = set()
-        self.word_report = []
-        self.glossary_file_path = glossary_file_path
-        self.OPENAI_API_KEY = OPENAI_API_KEY
+    def __init__(self,in_file,out_file,target_lang,glossary_path,key):
+        self.in_file,self.out_file=in_file,out_file
+        self.target=target_lang.lower()
+        self.glossary_path=glossary_path
+        self.key=key
 
-    def normalize_text(self, text):
-        """Normalize text: lowercase, remove extra spaces, keep spaces for phrases."""
-        if not text:
-            return text
-        text = re.sub(r'\s+', ' ', text.strip())
-        return text.lower()
+        self.extract=tempfile.mkdtemp(prefix="docx_")
+        self.word_ns="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
-    def read_document(self, file_path):
-        if file_path.endswith('.docx'):
-            doc = Document(file_path)
-            return '\n'.join([para.text for para in doc.paragraphs if para.text.strip()])
-        else:
-            raise ValueError("Only .docx supported.")
+        self.used_glossary_words=set()
+        self.used_glossary_pairs=set()
+        self.nonglossary_pairs=set()
+        self.word_report=[]
 
-    def load_glossary(self):
-        if not self.glossary_file_path or not os.path.exists(self.glossary_file_path):
-            print("No glossary file provided or file does not exist.")
-            return {}
-        ext = os.path.splitext(self.glossary_file_path)[1].lower()
-        try:
-            if ext == ".csv":
-                df = pd.read_csv(self.glossary_file_path)
-            elif ext in [".xlsx", ".xls"]:
-                df = pd.read_excel(self.glossary_file_path)
-            else:
-                print("Unsupported glossary file format. Expected .csv or .xlsx.")
-                return {}
-            # Look for English and target language columns
-            word_col = None
-            trans_col = None
-            for col in df.columns:
-                col_lower = col.strip().lower()
-                if col_lower in ["word", "english"]:
-                    word_col = col
-                if col_lower == self.target_language or col_lower in ["translation", "arabic", "urdu"]:
-                    trans_col = col
-            if not word_col or not trans_col:
-                print(f"Glossary columns not found. Expected 'English' and '{self.target_language}' or 'translation'.")
-                return {}
-            glossary = {
-                str(word).strip().lower(): str(translation).strip()
-                for word, translation in zip(df[word_col], df[trans_col])
-                if str(word).strip() and str(translation).strip() and pd.notna(word) and pd.notna(translation)
-            }
-            print(f"Loaded glossary with {len(glossary)} entries: {list(glossary.items())[:5]}...")
-            return glossary
-        except Exception as e:
-            print(f"Error loading glossary: {e}")
-            return {}
+    # ------------- helpers -------------
+    @staticmethod
+    def _norm(s): return re.sub(r"\s+"," ",s.strip()).lower() if s else s
+    def _sanitize(self,pairs):
+        return [(str(p[0]),str(p[1])) for p in pairs if isinstance(p,(list,tuple)) and len(p)==2]
+    # -------- glossary --------
+    def _load_glossary(self):
+        if not(self.glossary_path and os.path.exists(self.glossary_path)): return {}
+        ext=os.path.splitext(self.glossary_path)[1].lower()
+        df=pd.read_csv(self.glossary_path) if ext==".csv" else pd.read_excel(self.glossary_path)
+        wcol=tcol=None
+        for c in df.columns:
+            cl=c.strip().lower()
+            if cl in("word","english"): wcol=c
+            if cl in(self.target,"translation","arabic","urdu"): tcol=c
+        if not(wcol and tcol): return {}
+        return {str(w).strip().lower():str(t).strip()
+                for w,t in zip(df[wcol],df[tcol]) if pd.notna(w) and pd.notna(t)}
+    # -------- file ops --------
+    def _extract(self):
+        with zipfile.ZipFile(self.in_file) as z: z.extractall(self.extract)
+        return os.path.join(self.extract,"word","document.xml")
+    def _repack(self):
+        base=self.out_file[:-5]
+        shutil.make_archive(base,"zip",self.extract)
+        if os.path.exists(self.out_file): os.remove(self.out_file)
+        os.rename(base+".zip",self.out_file)
+    # ----- numbering tweak -----
+    def _arabize_numbering(self):
+        num_path = os.path.join(self.extract, "word", "numbering.xml")
+        if not (self.target in RTL_LANGUAGES and os.path.exists(num_path)):
+            return
 
-    def get_used_glossary_words(self):
-        return list(self.used_glossary_words)
+        tree = etree.parse(num_path)
+        for fmt in tree.xpath('//w:numFmt', namespaces={'w': self.word_ns}):
+            val = fmt.get(f'{{{self.word_ns}}}val')
+            if val in ("decimal", "decimalZero", "decimalFullWidth", "decimalHalfWidth"):
+                fmt.set(f'{{{self.word_ns}}}val', "hindiNumbers")   # ← only change
 
-    def get_used_glossary_pairs(self):
-        return list(self.used_glossary_pairs)
+        tree.write(num_path, encoding="utf-8", xml_declaration=True)
+    # -------- text helpers -----
+    def _apply_glossary(self,txt,g):
+        out=txt
+        for gw,gt in sorted(g.items(),key=lambda kv:-len(kv[0])):
+            out=re.sub(rf'(?<!\S){re.escape(gw)}(?!\S)',gt,out,flags=re.IGNORECASE)
+        return out
+    def _tokenize(self,txt,g):
+        matches=[]; tl=self._norm(txt)
+        for gw in sorted(g,key=len,reverse=True):
+            pat=rf'(?<!\w){re.escape(gw)}(?!\w)' if self.target in("ar","ur") else rf'\b{re.escape(gw)}\b'
+            for m in re.finditer(pat,tl,re.IGNORECASE): matches.append((m.start(),m.end(),gw))
+        matches.sort(); words,last=[],0
+        for s,e,gw in matches:
+            words+=re.findall(r'\S+',txt[last:s]); words.append(gw); last=e
+        words+=re.findall(r'\S+',txt[last:]); return words
+    # -------- translate text -------
+    def translate_text(self,text):
+        if not text.strip(): return text,[],[]
+        prefix,core=split_prefix(text)
 
-    def get_nonglossary_pairs(self):
-        return list(self.nonglossary_pairs)
+        gloss=self._load_glossary()
+        for gw in gloss:
+            if re.search(rf'\b{re.escape(gw)}\b',self._norm(core)):
+                self.used_glossary_words.add(gw)
+                self.used_glossary_pairs.add((gw,gloss[gw]))
 
-    def get_word_report(self):
-        return self.word_report
+        trans_core=self._apply_glossary(core,gloss)
+        tokens=self._tokenize(core,gloss)
+        need_llm=[t for t in tokens if t.lower() not in gloss]
 
-    def extract_docx(self):
-        with zipfile.ZipFile(self.input_file, 'r') as zip_ref:
-            zip_ref.extractall(self.extract_folder)
-        return os.path.join(self.extract_folder, "word", "document.xml")
-
-    def create_translated_docx(self):
-        base_name = self.output_file.replace('.docx', '')
-        shutil.make_archive(base_name, 'zip', self.extract_folder)
-        if os.path.exists(self.output_file):
-            os.remove(self.output_file)
-        os.rename(base_name + '.zip', self.output_file)
-
-    def _check_glossary_in_text(self, text, glossary):
-        """Check for glossary words/phrases in text and track usage."""
-        matches = []
-        text_lower = self.normalize_text(text)
-        for gloss_word in sorted(glossary, key=lambda x: len(x), reverse=True):
-            gloss_word_lower = self.normalize_text(gloss_word)
-            # Use word boundaries for English, relaxed boundaries for Arabic/Urdu
-            if self.target_language in ['ar', 'urdu']:
-                pattern = rf'(?<!\w){re.escape(gloss_word_lower)}(?!\w)'
-            else:
-                pattern = rf'\b{re.escape(gloss_word_lower)}\b'
-            if re.search(pattern, text_lower, re.IGNORECASE):
-                self.used_glossary_words.add(gloss_word)
-                self.used_glossary_pairs.add((gloss_word, glossary[gloss_word]))
-                matches.append((gloss_word, glossary[gloss_word]))
-                self.word_report.append({
-                    'Original Word': gloss_word,
-                    'Translated Word': glossary[gloss_word],
-                    'Source': 'Glossary',
-                    'Used in Document': 'Yes'
-                })
-        print(f"Glossary matches for text '{text[:50]}...': {matches}")
-        return matches
-
-    def _tokenize_words(self, text, glossary):
-        """Tokenize text into words, preserving multi-word glossary phrases."""
-        words = []
-        text_lower = self.normalize_text(text)
-        original_text = text
-        matched_positions = []
-        for gloss_word in sorted(glossary, key=lambda x: len(x), reverse=True):
-            gloss_word_lower = self.normalize_text(gloss_word)
-            if self.target_language in ['ar', 'urdu']:
-                pattern = rf'(?<!\w){re.escape(gloss_word_lower)}(?!\w)'
-            else:
-                pattern = rf'\b{re.escape(gloss_word_lower)}\b'
-            for match in re.finditer(pattern, text_lower, re.IGNORECASE):
-                start, end = match.span()
-                matched_positions.append((start, end, gloss_word, glossary[gloss_word]))
-        matched_positions.sort()
-        last_end = 0
-        for start, end, gloss_word, translation in matched_positions:
-            before_text = original_text[last_end:start]
-            if before_text:
-                words.extend(re.findall(r'\S+', before_text))
-            words.append(gloss_word)
-            last_end = end
-        if last_end < len(original_text):
-            words.extend(re.findall(r'\S+', original_text[last_end:]))
-        return words
-
-    def translate_text(self, text):
-        if not text.strip():
-            return text, [], []
-        glossary = self.load_glossary()
-
-        # Step 1: Check for glossary matches and track them
-        matches = self._check_glossary_in_text(text, glossary)
-
-        # Step 2: Replace glossary terms in the text
-        translated_text = text
-        for gloss_word in sorted(glossary, key=lambda x: len(x), reverse=True):
-            pattern = rf'(?<!\S){re.escape(gloss_word)}(?!\S)'
-            translated_text = re.sub(pattern, glossary[gloss_word], translated_text, flags=re.IGNORECASE)
-
-        # Step 3: Tokenize the original text to track non-glossary words
-        words = self._tokenize_words(text, glossary)
-        non_glossary_words = [w for w in words if w.lower() not in glossary]
-
-        # Step 4: Translate non-glossary words using LLM and get lists
-        local_glossary_pairs = []
-        local_nonglossary_pairs = []
-        if non_glossary_words:
-            prompt = PromptTemplate.from_template(
-                """
-                You are a professional translator. Translate the given text from {source_language} to {output_language}.
-                Your translations must be precise, accurate, and natural-sounding in the target language.
-
-                Reference Glossary (use these translations if the word matches exactly, case-insensitive):
+        gloss_pairs=nongloss_pairs=[]
+        if need_llm:
+            prompt=PromptTemplate.from_template(
+                """Translate from {source_language} to {output_language}.
+                Glossary:
                 {glossary_context}
-
-                Text to translate ({source_language}):
+                Text:
                 {input}
-
-                Your response **must** be a valid JSON object with the following structure:
-                {{
-                    "translated_text": "translated text here",
-                    "glossary_pairs": [["original word", "translated word"], ...],
-                    "nonglossary_pairs": [["original word", "translated word"], ...]
-                }}
-                - "translated_text": The fully translated text. If no translation is needed, return the input text.
-                - "glossary_pairs": List of [original, translated] pairs for words found in the glossary. Return an empty list if none apply.
-                - "nonglossary_pairs": List of [original, translated] pairs for words translated by you. Return an empty list if none apply.
-                If the input text is empty or untranslatable, return an empty JSON object with the above structure.
-                Ensure the response is valid JSON with proper syntax.
-                """
+                Return JSON:
+                {{"translated_text":"...","glossary_pairs":[...],"nonglossary_pairs":[...]}}"""
             )
-            glossary_context = "\n".join([f"{word}: {translation}" for word, translation in glossary.items()])
-            llm = ChatOpenAI(model_name="gpt-4o", api_key=self.OPENAI_API_KEY, temperature=0.3)
-            chain = prompt | llm
-
-            max_retries = 3
-            for attempt in range(max_retries):
+            ctx="\n".join(f"{w}: {t}" for w,t in gloss.items())
+            tgt="Arabic" if self.target=="ar" else "Urdu" if self.target=="ur" else self.target
+            llm=ChatOpenAI(model_name="gpt-4o",api_key=self.key,temperature=0.3)
+            chain=prompt|llm
+            for _ in range(3):
                 try:
-                    target_lang = self.target_language
-                    if target_lang == "ar":
-                        target_lang = "Arabic"
-                    elif target_lang == "ur":
-                        target_lang = "Urdu"
-                    response = chain.invoke({
-                        "source_language": self.source_lang,
-                        "output_language": target_lang,
-                        "input": text,
-                        "glossary_context": glossary_context
-                    })
-                    # Log raw response for debugging
-                    print(f"LLM Response (Attempt {attempt + 1}): {response.content}")
-                    
-                    # Clean response to handle BOM or encoding issues
-                    response_content = response.content.strip()
-                    if not response_content:
-                        print("Translation error: Empty LLM response")
-                        break
-                    
-                    # Remove BOM if present
-                    response_content = response_content.encode('utf-8').decode('utf-8-sig')
-                    
-                    # Extract JSON from Markdown code block if present
-                    json_match = re.search(r'```json\n([\s\S]*?)\n```', response_content)
-                    if json_match:
-                        response_content = json_match.group(1).strip()
-                    else:
-                        # If no Markdown wrapper, assume response is raw JSON
-                        response_content = response_content.strip()
-                    
-                    # Log the exact string being parsed
-                    print(f"Content to parse (Attempt {attempt + 1}): {repr(response_content)}")
-                    
-                    # Parse JSON response
-                    result = json.loads(response_content)
-                    
-                    # Validate JSON structure
-                    if not isinstance(result, dict) or "translated_text" not in result:
-                        print("Translation error: Invalid JSON structure")
-                        break
-                    
-                    translated_text = result.get("translated_text", translated_text)
-                    local_glossary_pairs = result.get("glossary_pairs", [])
-                    local_nonglossary_pairs = result.get("nonglossary_pairs", [])
+                    raw=chain.invoke({
+                        "source_language":"English",
+                        "output_language":tgt,
+                        "input":core,
+                        "glossary_context":ctx
+                    }).content.strip().encode("utf-8").decode("utf-8-sig")
+                    m=re.search(r"```json\n([\s\S]*?)\n```",raw)
+                    data=json.loads(m.group(1) if m else raw)
+                    trans_core=data.get("translated_text",trans_core)
+                    gloss_pairs=self._sanitize(data.get("glossary_pairs",[]))
+                    nongloss_pairs=self._sanitize(data.get("nonglossary_pairs",[]))
+                    break
+                except Exception: continue
 
-                    # Validate glossary pairs against loaded glossary
-                    valid_glossary_pairs = [(orig, trans) for orig, trans in local_glossary_pairs if orig.lower() in glossary and glossary[orig.lower()] == trans]
-                    for orig, trans in valid_glossary_pairs:
-                        if trans.strip() and trans != orig:
-                            self.used_glossary_pairs.add((orig, trans))
-                            self.used_glossary_words.add(orig)
-                            if not any(r['Original Word'] == orig and r['Source'] == 'Glossary' for r in self.word_report):
-                                self.word_report.append({
-                                    'Original Word': orig,
-                                    'Translated Word': trans,
-                                    'Source': 'Glossary',
-                                    'Used in Document': 'Yes'
-                                })
-                    for orig, trans in local_nonglossary_pairs:
-                        if trans.strip() and trans != orig:
-                            self.nonglossary_pairs.add((orig, trans))
-                            self.word_report.append({
-                                'Original Word': orig,
-                                'Translated Word': trans,
-                                'Source': 'LLM',
-                                'Used in Document': 'Yes'
-                            })
-                    break  # Success, exit retry loop
-                except json.JSONDecodeError as e:
-                    print(f"Translation error: JSON parsing failed: {e}")
-                    print(f"Failed content: {repr(response_content)}")
-                    if attempt == max_retries - 1:
-                        print("Max retries reached. Using glossary-based translation as fallback.")
-                        break
-                except Exception as e:
-                    print(f"Translation error: {e}")
-                    print(f"Failed content: {repr(response_content)}")
-                    if attempt == max_retries - 1:
-                        print("Max retries reached. Using glossary-based translation as fallback.")
-                        break
+        if self.target in RTL_LANGUAGES:
+            trans_core=normalize_rtl_punctuation(trans_core)
 
-        return translated_text, local_glossary_pairs, local_nonglossary_pairs
-
-    def translate_xml_to_language(self, xml_path, source_lang="en", target_lang="ur", output_path=None):
-        parser = etree.XMLParser(remove_blank_text=False)
-        tree = etree.parse(xml_path, parser)
-        root = tree.getroot()
-
-        # 1. Translate each paragraph's text
-        for element in root.iter(f'{{{self.word_ns}}}p'):
-            paragraph_text = ''
-            text_elements = []
-            for t in element.iter(f'{{{self.word_ns}}}t'):
-                if t.text and t.text.strip():
-                    paragraph_text += t.text
-                    text_elements.append((t, 'text'))
-                if t.tail and t.tail.strip():
-                    paragraph_text += t.tail
-                    text_elements.append((t, 'tail'))
-            if paragraph_text.strip():
-                translated_text, gloss_pairs, nongloss_pairs = self.translate_text(paragraph_text)
-                for t, t_type in text_elements:
-                    if t_type == 'text' and t.text.strip():
-                        t.text = translated_text
-                        translated_text = ''
-                    elif t_type == 'tail' and t.tail.strip():
-                        t.tail = translated_text
-                        translated_text = ''
-
-        # 2. Force RTL and right-aligned formatting if needed
-        if target_lang.lower() in [lang.lower() for lang in RTL_LANGUAGES]:
-            print(f"Applying RTL formatting for {target_lang}...")
-            for p in root.findall('.//w:p', namespaces={'w': self.word_ns}):
-                # Get or create paragraph properties (w:pPr)
-                pPr = p.find('w:pPr', namespaces={'w': self.word_ns})
-                if pPr is None:
-                    pPr = etree.SubElement(p, '{%s}pPr' % self.word_ns)
-                # Add the bidi element if it's not already present
-                if pPr.find('{%s}bidi' % self.word_ns) is None:
-                    etree.SubElement(pPr, '{%s}bidi' % self.word_ns)
-
-        # Save the translated XML if output path is provided
-        if output_path:
-            with open(output_path, "w", encoding="utf-8") as f:
-                f.write(etree.tostring(root, encoding='unicode', pretty_print=True))
+        if prefix and self.target in RTL_LANGUAGES:
+            pr=to_arabic_prefix(prefix)
+            translated=f"{pr}{RLM}\u00A0{trans_core}"
         else:
-            print(etree.tostring(root, encoding='unicode', pretty_print=True))
+            translated=f"{prefix}{RLM} {trans_core}" if prefix else trans_core
 
+        for o,t in gloss_pairs:   self.used_glossary_pairs.add((o,t))
+        for o,t in nongloss_pairs:self.nonglossary_pairs.add((o,t))
 
-    def generate_usage_report(self):
-        glossary = self.load_glossary()
-        used_words = set(self.used_glossary_words)
-        for word, translation in glossary.items():
-            if word not in used_words and not any(
-                r['Original Word'] == word and r['Source'] == 'Glossary' for r in self.word_report
-            ):
-                self.word_report.append({
-                    'Original Word': word,
-                    'Translated Word': translation,
-                    'Source': 'Glossary',
-                    'Used in Document': 'No'
-                })
-        return self.word_report
-
+        return translated,gloss_pairs,nongloss_pairs
+    # ---------- XML walk ----------
+    def _translate_xml(self,xml_path):
+        tree=etree.parse(xml_path,etree.XMLParser(remove_blank_text=False))
+        root=tree.getroot()
+        for p in root.iter(f'{{{self.word_ns}}}p'):
+            combined,segs="",[]
+            for t in p.iter(f'{{{self.word_ns}}}t'):
+                if t.text and t.text.strip():
+                    combined+=t.text; segs.append((t,"text"))
+                if t.tail and t.tail.strip():
+                    combined+=t.tail; segs.append((t,"tail"))
+            if combined.strip():
+                new,_,_=self.translate_text(combined)
+                for el,kind in segs:
+                    if kind=="text" and el.text and el.text.strip():
+                        el.text,new=new,""
+                    elif kind=="tail" and el.tail and el.tail.strip():
+                        el.tail,new=new,""
+        if self.target in RTL_LANGUAGES:
+            for p in root.findall(".//w:p",namespaces={"w":self.word_ns}):
+                pPr=p.find("w:pPr",namespaces={"w":self.word_ns})
+                if pPr is None:
+                    pPr=etree.SubElement(p,f"{{{self.word_ns}}}pPr")
+                if pPr.find(f"{{{self.word_ns}}}bidi") is None:
+                    etree.SubElement(pPr,f"{{{self.word_ns}}}bidi")
+        with open(xml_path,"w",encoding="utf-8") as f:
+            f.write(etree.tostring(root,encoding="unicode",pretty_print=True))
+    # ---------- driver ----------
     def run(self):
-        if os.path.exists(self.extract_folder):
-            try:
-                shutil.rmtree(self.extract_folder)
-            except Exception as e:
-                print(f"Warning: Could not remove existing folder: {e}")
-        os.makedirs(self.extract_folder, exist_ok=True)
-
+        if os.path.exists(self.extract): shutil.rmtree(self.extract,ignore_errors=True)
+        os.makedirs(self.extract,exist_ok=True)
         try:
-            xml_path = self.extract_docx()
-            self.translate_xml_to_language(xml_path, source_lang="en", target_lang=self.target_language, output_path=xml_path)
-            self.create_translated_docx()
-            report = self.generate_usage_report()
-            report_df = pd.DataFrame(report)
-            report_df.to_csv("word_by_word_report.csv", index=False, encoding='utf-8')
-            print(f"Translation complete! Saved as: {self.output_file}")
-            print(f"Word-by-word report saved as: word_by_word_report.csv")
-            return report, self.get_used_glossary_pairs(), self.get_nonglossary_pairs()
-        except Exception as e:
-            print(f"Error during DOCX translation: {e}")
-            return [], [], []
-        finally:
-            if os.path.exists(self.extract_folder):
-                try:
-                    shutil.rmtree(self.extract_folder)
-                except Exception as e:
-                    print(f"Warning: Could not clean up temporary folder: {e}")
+            xml=self._extract()
+            self._translate_xml(xml)
+            self._arabize_numbering()   # <-- new numbering tweak
+            self._repack()
 
-def translate_file(input_file, output_file, target_language, glossary_file_path, OPENAI_API_KEY):
-    file_extension = os.path.splitext(input_file)[1].lower()
-    if file_extension == '.docx':
-        translator = DocxTranslator(input_file, output_file, target_language, glossary_file_path, OPENAI_API_KEY)
-    else:
-        raise ValueError(f"Unsupported file type: {file_extension}. Please use .docx")
-    report, used_glossary_pairs, nonglossary_pairs = translator.run()
-    return report, used_glossary_pairs, nonglossary_pairs
+            gloss=self._load_glossary()
+            for w,t in gloss.items():
+                if (w,t) not in self.used_glossary_pairs:
+                    self.word_report.append({"Original Word":w,"Translated Word":t,
+                                             "Source":"Glossary","Used in Document":"No"})
+            return (self.word_report,
+                    list(self.used_glossary_pairs),
+                    list(self.nonglossary_pairs))
+        finally:
+            shutil.rmtree(self.extract,ignore_errors=True)
+
+# -------- wrapper for Streamlit --------
+def translate_file(in_file,out_file,target_language,
+                   glossary_path,OPENAI_API_KEY):
+    if not in_file.lower().endswith(".docx"):
+        raise ValueError("Only .docx files are supported.")
+    return DocxTranslator(in_file,out_file,target_language,
+                          glossary_path,OPENAI_API_KEY).run()

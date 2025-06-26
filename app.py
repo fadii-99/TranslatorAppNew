@@ -14,7 +14,7 @@ st.set_page_config(page_title="Document Translator", layout="centered")
 st.title("Document Translator")
 
 # Upload DOCX file
-docx_file = st.file_uploader("Upload your docx file to translate", type=["docx"])
+docx_file = st.file_uploader("Upload your Word document to translate", type=["docx"])
 
 # Upload glossary file
 glossary_file = st.file_uploader("Upload your Glossary (CSV or Excel)", type=["csv", "xlsx"])
